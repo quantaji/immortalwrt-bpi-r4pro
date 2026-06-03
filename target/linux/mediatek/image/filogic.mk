@@ -79,6 +79,28 @@ define Build/mt798x-gpt
 	rm $@.tmp
 endef
 
+define Build/mt798x-r4pro-gpt
+	cp $@ $@.tmp 2>/dev/null || true
+	ptgen -g -o $@.tmp -a 1 -l 1024 \
+		$(if $(findstring sdmmc,$1), \
+			-H \
+			-t 0x83	-N bl2		-r	-p 4079k@17k \
+		) \
+			-t 0x83	-N ubootenv	-r	-p 512k@4M \
+			-t 0x83	-N factory	-r	-p 2M@4608k \
+			-t 0xef	-N fip		-r	-p 4M@6656k \
+				-N recovery	-r	-p 128M@12M \
+		$(if $(findstring sdmmc,$1), \
+				-N install	-r	-p 20M@140M \
+			-t 0x2e -N production		-p $(CONFIG_TARGET_ROOTFS_PARTSIZE)M@160M \
+		) \
+		$(if $(findstring emmc,$1), \
+			-t 0x2e -N production		-p $(CONFIG_TARGET_ROOTFS_PARTSIZE)M@160M \
+		)
+	cat $@.tmp >> $@
+	rm $@.tmp
+endef
+
 # Variation of the normal partition table to account
 # for factory and mfgdata partition
 #
@@ -728,6 +750,53 @@ define Device/bananapi_bpi-r4-poe
   SUPPORTED_DEVICES += bananapi,bpi-r4-2g5
 endef
 TARGET_DEVICES += bananapi_bpi-r4-poe
+
+define Device/bananapi_bpi-r4-pro-common
+  DEVICE_VENDOR := Bananapi
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_LOADADDR := 0x45f00000
+  DEVICE_DTC_FLAGS := --pad 4096
+  KERNEL_LOADADDR := 0x46000000
+  KERNEL			:= kernel-bin | gzip
+  KERNEL_INITRAMFS := kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
+endef
+
+define Device/bananapi_bpi-r4-pro-8x-common
+  $(call Device/bananapi_bpi-r4-pro-common)
+  DEVICE_DTS_OVERLAY:= mt7988a-bananapi-bpi-r4-pro-emmc mt7988a-bananapi-bpi-r4-pro-sd \
+		       mt7988a-bananapi-bpi-r4-pro-cn13 mt7988a-bananapi-bpi-r4-pro-cn14 \
+		       mt7988a-bananapi-bpi-r4-pro-cn15 mt7988a-bananapi-bpi-r4-pro-cn18
+  DEVICE_PACKAGES := kmod-hwmon-pwmfan kmod-i2c-mux-pca954x \
+		     kmod-eeprom-at24 kmod-rtc-pcf8563 kmod-sfp \
+		     kmod-phy-aquantia kmod-usb3 e2fsprogs f2fsck mkf2fs \
+		     kmod-gpio-pca953x kmod-nvme automount
+  IMAGES := sysupgrade.itb
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  ARTIFACTS := sdcard.img.gz
+  ARTIFACT/sdcard.img.gz	:= mt798x-r4pro-gpt sdmmc |\
+				   pad-to 17k | mt7988-bl2 sdmmc-$$(DEVICE_BL2) |\
+				   pad-to 6656k | mt7988-bl31-uboot $$(DEVICE_NAME)-sdmmc |\
+				$(if $(CONFIG_TARGET_ROOTFS_INITRAMFS),\
+				   pad-to 12M | append-image-stage initramfs-recovery.itb | check-size 128m |\
+				) \
+				$(if $(CONFIG_TARGET_ROOTFS_SQUASHFS),\
+				   pad-to 160M | append-image squashfs-sysupgrade.itb | check-size |\
+				) \
+				  gzip
+  IMAGE_SIZE := $$(shell expr 160 + $$(CONFIG_TARGET_ROOTFS_PARTSIZE))m
+  IMAGE/sysupgrade.itb := append-kernel | fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-with-rootfs | pad-rootfs | append-metadata
+endef
+
+define Device/bananapi_bpi-r4-pro-8x
+  DEVICE_MODEL := BPi-R4 Pro 8X
+  DEVICE_DTS := mt7988a-bananapi-bpi-r4-pro-8x
+  DEVICE_DTS_CONFIG := config-mt7988a-bananapi-bpi-r4-pro-8x
+  DEVICE_BL2 := comb-4bg
+  $(call Device/bananapi_bpi-r4-pro-8x-common)
+  DEVICE_PACKAGES += kmod-phy-aeonsemi-as21xxx
+endef
+TARGET_DEVICES += bananapi_bpi-r4-pro-8x
 
 define Device/bananapi_bpi-r4-lite
   DEVICE_VENDOR := Bananapi

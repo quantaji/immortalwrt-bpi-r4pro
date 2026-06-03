@@ -1,5 +1,6 @@
 set_preinit_iface() {
 	case $(board_name) in
+	bananapi,bpi-r4-pro-8x|\
 	bazis,ax3000wm|\
 	cudy,m3000-v1|\
 	cudy,m3000-v2-yt8821|\
@@ -49,4 +50,3 @@ set_preinit_iface() {
 }
 
 boot_hook_add preinit_main set_preinit_iface
-
