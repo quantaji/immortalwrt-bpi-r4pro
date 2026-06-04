@@ -30,6 +30,7 @@
 	chosen {
 		stdout-path = &serial0;
 		bootargs = "console=ttyS0,115200n1 pci=pcie_bus_perf root=/dev/fit0 rootwait";
+		rootdisk-spim-nand = <&ubi_rootfs>;
 	};
 
 	fan: pwm-fan {
@@ -212,10 +213,22 @@
 	};
 };
 
+/*
+ * TODO(vendor-convergence, Phase 9): official runtime/vendor DTS expose the
+ * final wired topology through Factory MAC nvmem cells, GMAC2, phy24, and the
+ * MxL86252C DSA switch. Keep this MT7530 lan5 minboot path until the MxL
+ * driver/tagger support is integrated and port enumeration is verified.
+ */
 &gmac0 {
 	status = "okay";
 };
 
+/*
+ * TODO(vendor-convergence, Phase 9): the refreshed 6.12 image shows eth1 but
+ * can fail PHY attach with -22 despite this vendor-style 10gbase-r/phy28
+ * description. Keep vendor DTS semantics here; compare AS21xxx/phylink/vendor
+ * Ethernet behavior instead of guessing a local mode change.
+ */
 &gmac1 {
 	phy-mode = "10gbase-r";
 	phy-connection-type = "10gbase-r";
@@ -304,6 +317,7 @@
 
 			buck4 {
 				regulator-name = "rt5190a-buck4";
+				/* TODO(vendor-convergence, Phase 13): vendor 8X DTS uses 850000 uV. */
 				regulator-min-microvolt = <1800000>;
 				regulator-max-microvolt = <1800000>;
 				regulator-allowed-modes =
@@ -314,6 +328,7 @@
 
 			ldo {
 				regulator-name = "rt5190a-ldo";
+				/* TODO(vendor-convergence, Phase 13): vendor 8X DTS uses 1200000 uV. */
 				regulator-min-microvolt = <1800000>;
 				regulator-max-microvolt = <1800000>;
 				regulator-boot-on;
@@ -372,17 +387,41 @@
 			#size-cells = <0>;
 		};
 
-		imux2_sfp2: i2c@2 {
-			reg = <2>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-		};
+			imux2_sfp2: i2c@2 {
+				reg = <2>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+			};
 
-		imux3_wifi: i2c@3 {
-			reg = <3>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-		};
+			imux3_wifi: i2c@3 {
+				reg = <3>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/*
+				 * Official runtime confirms at24 6-0051. Do not add the
+				 * vendor Wi-Fi overlay's 0x52 EEPROM until live DT/I2C
+				 * evidence proves that second EEPROM exists.
+				 */
+				wifi_eeprom_5g: eeprom@51 {
+					compatible = "atmel,24c02";
+					reg = <0x51>;
+					address-width = <8>;
+					pagesize = <8>;
+					size = <256>;
+
+					nvmem-layout {
+						compatible = "fixed-layout";
+						#address-cells = <1>;
+						#size-cells = <1>;
+
+						macaddr_5g: macaddr@0 {
+							reg = <0x0 0x6>;
+						};
+					};
+				};
+
+			};
 	};
 };
 
@@ -418,13 +457,39 @@
 
 /* mPCIe SIM2 (11300000) */
 &pcie0 {
+	/*
+	 * TODO(vendor-convergence, Phase 12): vendor main DTS uses PCIe pinctrl,
+	 * device_type = "pci", and mediatek,mtd-eeprom = <&factory 0x0>. The
+	 * current child uses the official-runtime-confirmed 0x51 EEPROM nvmem cell
+	 * until Factory/eeprom source and mt76 expectations are verified together.
+	 */
 	status = "okay";
+
+	pcie@0,0 {
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+
+		wifi@0,0 {
+			compatible = "mediatek,mt76";
+			reg = <0x0000 0 0 0 0>;
+			nvmem-cells = <&macaddr_5g>;
+			nvmem-cell-names = "mac-address";
+		};
+	};
 };
 
 /* mPCIe (11310000 near leds) SIM3 */
 &pcie1 {
+	/* TODO(vendor-convergence, Phase 12): add mt76/nvmem child only after 0x52 EEPROM evidence. */
 	status = "okay";
 };
+
+/*
+ * TODO(vendor-convergence, Phase 12/13): vendor 8X DTS assigns pcie0_pins
+ * through pcie3_pins. Add verified 6.12 pinctrl nodes together with Wi-Fi,
+ * NVMe, and 5G/PCIe-mux validation instead of copying unavailable labels.
+ */
 
 /* M.2 (11280000) 1L0 key-m SSD1 CN13 / key-b SIM1 CN15 */
 &pcie2 {
@@ -491,6 +556,13 @@
 		};
 	};
 
+	/* MxL86252C 2.5G switch reset pin GPIO4: high; not vendor overlay wifi_12v. */
+	switch_hrstn {
+		gpio-hog;
+		gpios = <4 GPIO_ACTIVE_HIGH>;
+		output-high;
+	};
+
 	/* 1L0 0=key-b (CN15), 1=key-m (CN13) */
 	pcie-2-hog {
 		gpio-hog;
@@ -552,8 +624,20 @@
 		};
 
 		partition@200000 {
+			reg = <0x200000 0x400000>;
+			label = "Factory";
+			/* TODO(vendor-convergence, Phase 9): add Factory MAC nvmem cells after source verification. */
+		};
+
+		/*
+		 * TODO(vendor-convergence, Phase 10): vendor 8X also has a
+		 * nandflash covering partition and uses u-boot,env-redundant-bool
+		 * without the 25.12 -layout suffix. Converge with image/sysupgrade
+		 * install artifact work, not as an isolated Phase 6 shortcut.
+		 */
+		partition@600000 {
 			compatible = "linux,ubi";
-			reg = <0x200000 0xfe00000>;
+			reg = <0x600000 0xfa00000>;
 			label = "ubi";
 
 			volumes {
@@ -581,6 +665,7 @@
 
 /* back USB */
 &ssusb0 {
+	/* TODO(vendor-convergence, Phase 13): verify vendor deletion of mediatek,p0_speed_fixup before changing USB behavior. */
 	/* Use U2P only instead of both U3P/U2P due to U3P serdes shared with pcie2 */
 	phys = <&xphyu2port0 PHY_TYPE_USB2>;
 	mediatek,u3p-dis-msk = <1>;

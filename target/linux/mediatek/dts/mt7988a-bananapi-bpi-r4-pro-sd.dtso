@@ -13,6 +13,11 @@
 	compatible = "bananapi,bpi-r4-pro", "mediatek,mt7988a";
 };
 
+/*
+ * TODO(vendor-convergence, Phase 10): vendor 8X overlays are 8X-named and use
+ * the block-device/u-boot,env layout shape. Keep this boot-tested overlay until
+ * image bootconf, overlay naming, and install artifacts are converged together.
+ */
 &{/soc/mmc@11230000} {
 	pinctrl-names = "default", "state_uhs";
 	pinctrl-0 = <&mmc0_pins_sdcard>;

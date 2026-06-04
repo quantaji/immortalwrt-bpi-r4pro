@@ -1153,7 +1153,7 @@ define U-Boot/mt7988_bananapi_bpi-r4-pro-8x-sdmmc
   UBOOT_IMAGE:=u-boot.fip
   BL2_BOOTDEV:=sdmmc
   BL2_SOC:=mt7988
-  BL2_DDRTYPE:=comb
+  BL2_DDRTYPE:=comb-4bg
   DEPENDS:=+trusted-firmware-a-mt7988-sdmmc-comb-4bg
 endef
 
