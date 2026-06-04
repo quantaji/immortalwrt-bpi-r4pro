@@ -16,6 +16,7 @@
 / {
 	aliases {
 		ethernet0 = &gmac0;
+		ethernet1 = &gmac1;
 		i2c0 = &i2c0;
 		i2c1 = &i2c1;
 		i2c2 = &i2c2;
@@ -184,9 +185,41 @@
 	pinctrl-0 = <&mdio0_pins>;
 	pinctrl-names = "default";
 	status = "okay";
+
+	mux: mux-bus {
+		mux1: ethernet-mux@1 {
+			compatible = "mediatek,eth-mux";
+			reg = <1>;
+			chan-sel-gpios = <&pio 3 GPIO_ACTIVE_HIGH>;
+			mod-def0-gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+			sfp-present-channel = <1>;
+
+			channel_10: channel@0 {
+				reg = <0>;
+				phy-mode = "10gbase-r";
+				phy-connection-type = "10gbase-r";
+				phy-handle = <&phy28>;
+			};
+
+			channel_11: channel@1 {
+				reg = <1>;
+				phy-mode = "10gbase-r";
+				phy-connection-type = "10gbase-r";
+				managed = "in-band-status";
+				sfp = <&sfp2>;
+			};
+		};
+	};
 };
 
 &gmac0 {
+	status = "okay";
+};
+
+&gmac1 {
+	phy-mode = "10gbase-r";
+	phy-connection-type = "10gbase-r";
+	phy = <&phy28>;
 	status = "okay";
 };
 
@@ -349,6 +382,36 @@
 			reg = <3>;
 			#address-cells = <1>;
 			#size-cells = <0>;
+		};
+	};
+};
+
+&mdio_bus {
+	phy28: ethernet-phy@28 {
+		compatible = "ethernet-phy-ieee802.3-c45";
+		reg = <28>;
+		reset-gpios = <&pio 82 GPIO_ACTIVE_LOW>;
+		reset-assert-us = <200000>;
+		reset-deassert-us = <350000>;
+		firmware-name = "as21x1x_fw.bin";
+
+		leds {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			phy28_led0: led@0 {
+				reg = <0>;
+				linux,default-trigger = "netdev";
+				active-high;
+				status = "okay";
+			};
+
+			phy28_led1: led@1 {
+				reg = <1>;
+				linux,default-trigger = "netdev";
+				active-high;
+				status = "okay";
+			};
 		};
 	};
 };
