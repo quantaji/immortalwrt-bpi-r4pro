@@ -47,13 +47,11 @@ for device_id, profile in output.get("profiles", {}).items():
 
 
 if output:
-    (
-        default_packages,
-        output["arch_packages"],
-        linux_version,
-        linux_release,
-        linux_vermagic,
-    ) = run(
+    # Local-only build workaround: do not include this in the future BPI-R4 Pro PR.
+    make_env = environ.copy()
+    make_env["TOPDIR"] = str(Path().cwd())
+
+    make_output = run(
         [
             "make",
             "--no-print-directory",
@@ -68,9 +66,30 @@ if output:
         ],
         stdout=PIPE,
         check=True,
-        env=environ.copy().update({"TOPDIR": Path().cwd()}),
+        env=make_env,
         universal_newlines=True,
     ).stdout.splitlines()
+
+    make_values = [
+        line
+        for line in make_output
+        if line
+        and not line.startswith(("make[", "WARNING:", "time:", "Checking "))
+    ]
+
+    if len(make_values) < 5:
+        raise RuntimeError(
+            "target/linux make value query returned fewer than 5 values:\n"
+            + "\n".join(make_output)
+        )
+
+    (
+        default_packages,
+        output["arch_packages"],
+        linux_version,
+        linux_release,
+        linux_vermagic,
+    ) = make_values[-5:]
 
     output["default_packages"] = sorted(default_packages.split())
     output["linux_kernel"] = {
