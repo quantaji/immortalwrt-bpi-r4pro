@@ -9,7 +9,9 @@ To force C45 OPs with generic PHY function, clear the C22 bit from
 devices_in_package bitmask.
 
 Fixes: 830877d89edc ("net: phy: Add support for Aeonsemi AS21xxx PHYs")
-Origin: target/linux/airoha/patches-6.12/802-03-net-phy-as21xxx-force-C45-OPs-for-AUTONEG.patch
+Source: target/linux/airoha/patches-6.12/802-03-net-phy-as21xxx-force-C45-OPs-for-AUTONEG.patch
+Behavior source: AS21xxx requires Clause 45 autoneg operations for stable
+restart/configuration at speeds above 1G.
 Adapted-for: mediatek/filogic BPI-R4 Pro 8X Phase 9.1
 Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>

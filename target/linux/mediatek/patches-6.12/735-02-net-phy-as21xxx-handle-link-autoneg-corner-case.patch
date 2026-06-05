@@ -5,7 +5,9 @@ Add missing case in custom read_link, when autoneg is started, autoneg
 complete bit is reset but link is still not up.
 
 Fixes: 830877d89edc ("net: phy: Add support for Aeonsemi AS21xxx PHYs")
-Origin: target/linux/airoha/patches-6.12/802-01-net-phy-as21xxx-handle-corner-case-with-link-and-aut.patch
+Source: target/linux/airoha/patches-6.12/802-01-net-phy-as21xxx-handle-corner-case-with-link-and-aut.patch
+Behavior source: AS21xxx autoneg can be in progress with autoneg-complete
+cleared while link is still not up; report link down until completion.
 Adapted-for: mediatek/filogic BPI-R4 Pro 8X Phase 9.1
 Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>

@@ -9,11 +9,14 @@ Introduce a PHY driver flag to skip the detach-time reset only for
 drivers that opt in, and set it on AS21xxx firmware-backed PHY IDs.
 This keeps other reset paths unchanged.
 
-Origin: derived from target/linux/airoha/patches-6.12/
+Source: derived from target/linux/airoha/patches-6.12/
 Original patches:
   801-01-net-phy-add-PHY_DETACH_NO_HW_RESET-PHY-flag.patch
   801-02-net-phy-as21xxx-add-flag-PHY_DETACH_NO_HW_RESET.patch
 Original-author: Christian Marangi <ansuelsmth@gmail.com>
+Behavior source: firmware-backed AS21xxx PHYs can lose runtime firmware
+state if phylib asserts their reset GPIO during detach after a failed or
+repeated attach attempt.
 Adapted-for: mediatek/filogic BPI-R4 Pro 8X Phase 9.1
 Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
 

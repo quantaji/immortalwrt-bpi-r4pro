@@ -32,7 +32,13 @@ Source: OpenWrt PR #21083 (refs/upstream/openwrt-main-pr21083).
 [OpenAI ChatGPT/Codex (GPT-5): imported from OpenWrt PR #21083 and
 staged for ImmortalWrt 25.12 / Linux 6.12.91. Locally adapted to carry
 the OpenWrt PR #23477 review fix which propagates negative XPCS firmware
-configuration results instead of reporting them as success.]
+configuration results instead of reporting them as success. PR #23477's
+OpenWrt 25.12 review also discussed pcs.supported_interfaces and
+10G_QXGMII differences; no local code change is made here for those.
+The PR author explicitly left pcs.supported_interfaces unused for the
+25.12 driver, and old-firmware port gating is handled by the later
+760-19 downstream compatibility patch so only ports 9 and 13 are
+ungated on firmware 1.0.70.]
 ---
  drivers/net/dsa/mxl862xx/mxl862xx-api.h     | 474 +++++++++++++++++++-
  drivers/net/dsa/mxl862xx/mxl862xx-cmd.h     |  13 +

@@ -19,7 +19,9 @@ from this problem.
 Worth to mention that when multiple Aeonsemi PHY are mounted, the
 workaround doesn't work if we write to another Aeonsemi PHY.
 
-Origin: target/linux/airoha/patches-6.12/804-net-phy-as21xxx-implement-read-workaround-for-C45-re.patch
+Source: target/linux/airoha/patches-6.12/804-net-phy-as21xxx-implement-read-workaround-for-C45-re.patch
+Behavior source: AS21xxx firmware-backed Clause 45 MDIO reads can return
+unreliable data unless followed by the documented safe dummy BMSR write.
 Adapted-for: mediatek/filogic BPI-R4 Pro 8X Phase 9.1
 Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>

@@ -12,7 +12,10 @@ Rework the read_status code to always read the speed from the vendor
 register and parse the generic bit only for the pause frame.
 
 Fixes: 830877d89edc ("net: phy: Add support for Aeonsemi AS21xxx PHYs")
-Origin: target/linux/airoha/patches-6.12/802-02-net-phy-as21xxx-fix-read_status-speed-handling.patch
+Source: target/linux/airoha/patches-6.12/802-02-net-phy-as21xxx-fix-read_status-speed-handling.patch
+Behavior source: AS21xxx needs vendor speed-status parsing for resolved
+NBASE-T speeds; generic autoneg linkmode resolution is insufficient above
+1G and the original speed-mask expression used the wrong mask.
 Adapted-for: mediatek/filogic BPI-R4 Pro 8X Phase 9.1
 Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
 Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
