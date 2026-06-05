@@ -767,7 +767,7 @@ define Device/bananapi_bpi-r4-pro-8x-common
   DEVICE_DTS_OVERLAY:= mt7988a-bananapi-bpi-r4-pro-emmc mt7988a-bananapi-bpi-r4-pro-sd \
 		       mt7988a-bananapi-bpi-r4-pro-cn13 mt7988a-bananapi-bpi-r4-pro-cn14 \
 		       mt7988a-bananapi-bpi-r4-pro-cn15 mt7988a-bananapi-bpi-r4-pro-cn18
-  DEVICE_PACKAGES := kmod-hwmon-pwmfan kmod-i2c-mux-pca954x \
+  DEVICE_PACKAGES := kmod-dsa-mxl862xx kmod-hwmon-pwmfan kmod-i2c-mux-pca954x \
 		     kmod-eeprom-at24 kmod-rtc-pcf8563 kmod-sfp \
 		     kmod-phy-aquantia kmod-usb3 e2fsprogs f2fsck mkf2fs \
 		     kmod-gpio-pca953x kmod-nvme automount

@@ -1,0 +1,628 @@
+From: OpenAI ChatGPT/Codex (GPT-5)
+Subject: [PATCH] net: dsa: mxl862xx: add optional ds-mux support
+
+Source: vendor 24.10 BPI-R4 Pro / BPI-R4 Pro 8X MxL862xx
+`mxl862xx,ds-mux` implementation and DTS topology:
+refs/vendor/bpi-r4pro-8x-openwrt24.10/target/linux/mediatek/files-6.6/drivers/net/dsa/mxl862xx/mxl862xx.c
+refs/vendor/bpi-r4pro-8x-openwrt24.10/target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/mt7988a-bananapi-bpi-r4-pro-8x.dts
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5) for ImmortalWrt 25.12 /
+Linux 6.12.91.
+
+The vendor BPI-R4 Pro 8X hardware uses a GPIO-controlled combo path on
+the MxL86252C switch: one user port can be switched between an SFP
+channel and a copper PHY channel according to the SFP MOD_DEF0 presence
+GPIO.  The upstream-style MxL862xx driver stack imported from OpenWrt PR
+#21083 does not include that vendor mux behavior.
+
+Keep the feature optional and device-tree driven.  Boards without a
+`ds-mux-bus` child under the MxL switch keep the PR driver behavior
+unchanged.  Compared with the vendor implementation, keep the same
+hardware semantics but isolate the mux code in a separate translation
+unit and harden the DSA/phylink lifetime handling: restore the original
+DSA phylink before switch unregister/shutdown, avoid destroying DSA's
+base phylink, and roll back on channel switch failure.
+
+--- a/drivers/net/dsa/mxl862xx/Makefile
++++ b/drivers/net/dsa/mxl862xx/Makefile
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_NET_DSA_MXL862) += mxl862xx_dsa.o
+-mxl862xx_dsa-y := mxl862xx.o mxl862xx-host.o mxl862xx-phylink.o mxl862xx-fw.o
++mxl862xx_dsa-y := mxl862xx.o mxl862xx-host.o mxl862xx-phylink.o mxl862xx-fw.o mxl862xx-mux.o
+--- a/drivers/net/dsa/mxl862xx/mxl862xx.c
++++ b/drivers/net/dsa/mxl862xx/mxl862xx.c
+@@ -18,6 +18,7 @@
+ #include "mxl862xx-cmd.h"
+ #include "mxl862xx-fw.h"
+ #include "mxl862xx-host.h"
++#include "mxl862xx-mux.h"
+ #include "mxl862xx-phylink.h"
+ 
+ /* Polling interval for RMON counter accumulation. At 2.5 Gbps with
+@@ -4359,14 +4360,34 @@ static int mxl862xx_probe(struct mdio_de
+ 
+ 	err = dsa_register_switch(ds);
+ 	if (err) {
+-		set_bit(MXL862XX_FLAG_WORK_STOPPED, &priv->flags);
+-		cancel_delayed_work_sync(&priv->stats_work);
+-		mxl862xx_host_shutdown(priv);
+-		for (i = 0; i < MXL862XX_MAX_PORTS; i++)
+-			cancel_work_sync(&priv->ports[i].host_flood_work);
++		goto err_stop_work;
+ 	}
+ 
+-	return err;
++	err = mxl862xx_mux_init(priv);
++	if (err)
++		goto err_unregister_switch;
++
++	return 0;
++
++err_unregister_switch:
++	set_bit(MXL862XX_FLAG_WORK_STOPPED, &priv->flags);
++	cancel_delayed_work_sync(&priv->stats_work);
++	mxl862xx_mux_release_all(priv);
++	dsa_unregister_switch(ds);
++	mxl862xx_host_shutdown(priv);
++	for (i = 0; i < MXL862XX_MAX_PORTS; i++)
++		cancel_work_sync(&priv->ports[i].host_flood_work);
++
++	return err;
++
++err_stop_work:
++	set_bit(MXL862XX_FLAG_WORK_STOPPED, &priv->flags);
++	cancel_delayed_work_sync(&priv->stats_work);
++	mxl862xx_host_shutdown(priv);
++	for (i = 0; i < MXL862XX_MAX_PORTS; i++)
++		cancel_work_sync(&priv->ports[i].host_flood_work);
++
++	return err;
+ }
+ 
+ static void mxl862xx_remove(struct mdio_device *mdiodev)
+@@ -4396,6 +4417,8 @@ static void mxl862xx_remove(struct mdio_
+ 		rtnl_unlock();
+ 	}
+ 
++	mxl862xx_mux_release_all(priv);
++
+ 	dsa_unregister_switch(ds);
+ 
+ 	mxl862xx_host_shutdown(priv);
+@@ -4420,11 +4443,13 @@ static void mxl862xx_shutdown(struct mdi
+ 
+ 	priv = ds->priv;
+ 
+-	dsa_switch_shutdown(ds);
+-
+ 	set_bit(MXL862XX_FLAG_WORK_STOPPED, &priv->flags);
+ 	cancel_delayed_work_sync(&priv->stats_work);
+ 
++	mxl862xx_mux_release_all(priv);
++
++	dsa_switch_shutdown(ds);
++
+ 	mxl862xx_host_shutdown(priv);
+ 
+ 	for (i = 0; i < MXL862XX_MAX_PORTS; i++)
+--- a/drivers/net/dsa/mxl862xx/mxl862xx.h
++++ b/drivers/net/dsa/mxl862xx/mxl862xx.h
+@@ -8,6 +8,7 @@
+ #include <net/dsa.h>
+ 
+ struct mxl862xx_priv;
++struct mxl862xx_port_mux;
+ 
+ #define MXL862XX_MAX_PORTS		17
+ #define MXL862XX_DEFAULT_BRIDGE		0
+@@ -373,6 +374,9 @@ union mxl862xx_fw_version {
+  *                      compared with MXL862XX_FW_VER_MIN()
+  * @serdes_ports:       SerDes interfaces incl. sub-interfaces in case of
+  *                      10G_QXGMII
++ * @port_muxes:         optional DT-described combo-port muxes.  A mux swaps
++ *                      the active DSA phylink of one user port between two
++ *                      channel nodes while preserving the original DSA phylink.
+  * @ports:              per-port state, indexed by switch port number
+  * @bridges:            maps DSA bridge number to firmware bridge ID;
+  *                      zero means no firmware bridge allocated for that
+@@ -397,6 +401,7 @@ struct mxl862xx_priv {
+ 	u16 drop_meter;
+ 	union mxl862xx_fw_version fw_version;
+ 	struct mxl862xx_pcs serdes_ports[8];
++	struct mxl862xx_port_mux *port_muxes[MXL862XX_MAX_PORTS];
+ 	struct mxl862xx_port ports[MXL862XX_MAX_PORTS];
+ 	u16 bridges[MXL862XX_MAX_BRIDGES + 1];
+ 	u16 evlan_ingress_size;
+--- /dev/null
++++ b/drivers/net/dsa/mxl862xx/mxl862xx-mux.c
+@@ -0,0 +1,475 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Optional GPIO-controlled combo-port mux support for MaxLinear MxL862xx.
++ *
++ * Based on the BPI-R4 Pro / BPI-R4 Pro 8X vendor 24.10 `mxl862xx,ds-mux`
++ * implementation, adapted for the upstream-style OpenWrt PR #21083 driver
++ * organization and Linux 6.12 DSA/phylink lifetime rules.
++ */
++
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/gpio/consumer.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_net.h>
++#include <linux/phylink.h>
++#include <linux/rtnetlink.h>
++#include <linux/workqueue.h>
++#include <net/dsa.h>
++
++#include "mxl862xx.h"
++#include "mxl862xx-mux.h"
++
++#define MXL862XX_MUX_CHANNELS		2
++#define MXL862XX_MUX_POLL_INTERVAL	msecs_to_jiffies(100)
++#define MXL862XX_MUX_START_DELAY	msecs_to_jiffies(3000)
++#define MXL862XX_MUX_SWITCH_SETTLE_MS	20
++
++struct mxl862xx_mux_channel {
++	struct device_node *np;
++	struct phylink *pl;
++};
++
++struct mxl862xx_port_mux {
++	struct mxl862xx_priv *priv;
++	struct dsa_port *dp;
++	struct gpio_desc *mod_def0_gpio;
++	struct gpio_desc *chan_sel_gpio;
++	struct mxl862xx_mux_channel channels[MXL862XX_MUX_CHANNELS];
++	struct device_node *base_dn;
++	struct phylink *base_pl;
++	unsigned int active_channel;
++	unsigned int sfp_present_channel;
++	struct delayed_work work;
++	bool initialized;
++};
++
++static bool mxl862xx_mux_compatible(struct device_node *np)
++{
++	return of_device_is_compatible(np, "mxl862xx,ds-mux") ||
++	       of_device_is_compatible(np, "maxlinear,mxl862xx-port-mux");
++}
++
++static bool mxl862xx_mux_channel_ready(struct mxl862xx_port_mux *mux,
++				       unsigned int channel)
++{
++	return channel < MXL862XX_MUX_CHANNELS &&
++	       mux->channels[channel].np && mux->channels[channel].pl;
++}
++
++static int mxl862xx_mux_get_channel(struct mxl862xx_port_mux *mux)
++{
++	int present;
++
++	present = gpiod_get_value_cansleep(mux->mod_def0_gpio);
++	if (present < 0)
++		return present;
++
++	return present ? mux->sfp_present_channel : !mux->sfp_present_channel;
++}
++
++static bool mxl862xx_mux_user_running(struct mxl862xx_port_mux *mux)
++{
++	return mux->dp->user && netif_running(mux->dp->user);
++}
++
++static int mxl862xx_mux_reconnect_locked(struct phylink *pl,
++					 struct device_node *dn,
++					 bool start)
++{
++	int ret;
++
++	if (!pl || !dn)
++		return -EINVAL;
++
++	ret = phylink_of_phy_connect(pl, dn, 0);
++	if (ret)
++		return ret;
++
++	if (start)
++		phylink_start(pl);
++
++	return 0;
++}
++
++static void mxl862xx_mux_disconnect_locked(struct phylink *pl, bool stop)
++{
++	if (!pl)
++		return;
++
++	if (stop)
++		phylink_stop(pl);
++
++	phylink_disconnect_phy(pl);
++}
++
++static int
++mxl862xx_mux_switch_locked(struct mxl862xx_port_mux *mux,
++			   unsigned int new_channel)
++{
++	struct mxl862xx_mux_channel *channel = &mux->channels[new_channel];
++	struct dsa_port *dp = mux->dp;
++	struct device_node *old_dn = dp->dn;
++	struct phylink *old_pl = dp->pl;
++	unsigned int old_channel = mux->active_channel;
++	struct device *dev = mux->priv->ds->dev;
++	int ret, restore_ret;
++
++	if (!mxl862xx_mux_channel_ready(mux, new_channel))
++		return -EINVAL;
++
++	if (!mxl862xx_mux_user_running(mux))
++		return -ENETDOWN;
++
++	if (mux->initialized && mux->active_channel == new_channel)
++		return 0;
++
++	mxl862xx_mux_disconnect_locked(old_pl, true);
++
++	gpiod_set_value_cansleep(mux->chan_sel_gpio, new_channel);
++	msleep(MXL862XX_MUX_SWITCH_SETTLE_MS);
++
++	dp->dn = channel->np;
++	dp->pl = channel->pl;
++
++	ret = mxl862xx_mux_reconnect_locked(dp->pl, dp->dn, true);
++	if (ret)
++		goto restore;
++
++	mux->active_channel = new_channel;
++	mux->initialized = true;
++
++	dev_info(dev, "ds-mux: port %d switched to channel %u\n",
++		 dp->index, new_channel);
++
++	return 0;
++
++restore:
++	gpiod_set_value_cansleep(mux->chan_sel_gpio, old_channel);
++	msleep(MXL862XX_MUX_SWITCH_SETTLE_MS);
++
++	dp->dn = old_dn;
++	dp->pl = old_pl;
++
++	restore_ret = mxl862xx_mux_reconnect_locked(old_pl, old_dn, true);
++	if (restore_ret)
++		dev_warn(dev,
++			 "ds-mux: failed to restore port %d channel %u: %pe\n",
++			 dp->index, old_channel, ERR_PTR(restore_ret));
++
++	dev_warn(dev, "ds-mux: failed to switch port %d to channel %u: %pe\n",
++		 dp->index, new_channel, ERR_PTR(ret));
++
++	return ret;
++}
++
++static void mxl862xx_mux_restore_locked(struct mxl862xx_port_mux *mux)
++{
++	struct dsa_port *dp = mux->dp;
++	struct device *dev = mux->priv->ds->dev;
++	bool running = mxl862xx_mux_user_running(mux);
++	bool restore = dp->pl != mux->base_pl || dp->dn != mux->base_dn;
++	int ret;
++
++	if (!restore)
++		return;
++
++	mxl862xx_mux_disconnect_locked(dp->pl, running);
++
++	gpiod_set_value_cansleep(mux->chan_sel_gpio,
++				 !mux->sfp_present_channel);
++	msleep(MXL862XX_MUX_SWITCH_SETTLE_MS);
++
++	dp->dn = mux->base_dn;
++	dp->pl = mux->base_pl;
++	mux->active_channel = !mux->sfp_present_channel;
++	mux->initialized = false;
++
++	ret = mxl862xx_mux_reconnect_locked(mux->base_pl, mux->base_dn,
++					    running);
++	if (ret)
++		dev_warn(dev, "ds-mux: failed to restore port %d base phylink: %pe\n",
++			 dp->index, ERR_PTR(ret));
++}
++
++static void mxl862xx_mux_work(struct work_struct *work)
++{
++	struct mxl862xx_port_mux *mux =
++		container_of(to_delayed_work(work), struct mxl862xx_port_mux,
++			     work);
++	unsigned int channel;
++	int ret;
++
++	if (test_bit(MXL862XX_FLAG_WORK_STOPPED, &mux->priv->flags))
++		return;
++
++	ret = mxl862xx_mux_get_channel(mux);
++	if (ret < 0) {
++		dev_warn_ratelimited(mux->priv->ds->dev,
++				     "ds-mux: failed to read port %d MOD_DEF0: %pe\n",
++				     mux->dp->index, ERR_PTR(ret));
++		goto reschedule;
++	}
++
++	channel = ret;
++	if (!mxl862xx_mux_channel_ready(mux, channel)) {
++		dev_warn_ratelimited(mux->priv->ds->dev,
++				     "ds-mux: port %d channel %u is not configured\n",
++				     mux->dp->index, channel);
++		goto reschedule;
++	}
++
++	if (mux->initialized && mux->active_channel == channel)
++		goto reschedule;
++
++	if (!mxl862xx_mux_user_running(mux))
++		goto reschedule;
++
++	rtnl_lock();
++	if (!test_bit(MXL862XX_FLAG_WORK_STOPPED, &mux->priv->flags))
++		mxl862xx_mux_switch_locked(mux, channel);
++	rtnl_unlock();
++
++reschedule:
++	if (!test_bit(MXL862XX_FLAG_WORK_STOPPED, &mux->priv->flags))
++		mod_delayed_work(system_wq, &mux->work,
++				 MXL862XX_MUX_POLL_INTERVAL);
++}
++
++static void mxl862xx_mux_destroy_channels(struct mxl862xx_port_mux *mux)
++{
++	int i;
++
++	for (i = 0; i < MXL862XX_MUX_CHANNELS; i++) {
++		if (mux->channels[i].pl) {
++			phylink_destroy(mux->channels[i].pl);
++			mux->channels[i].pl = NULL;
++		}
++
++		of_node_put(mux->channels[i].np);
++		mux->channels[i].np = NULL;
++	}
++}
++
++static int mxl862xx_mux_add_channel(struct mxl862xx_port_mux *mux,
++				    struct device_node *np)
++{
++	struct device *dev = mux->priv->ds->dev;
++	phy_interface_t phy_mode;
++	struct phylink *pl;
++	u32 channel;
++	int ret;
++
++	ret = of_property_read_u32(np, "reg", &channel);
++	if (ret) {
++		dev_err(dev, "ds-mux: missing channel reg property\n");
++		return ret;
++	}
++
++	if (channel >= MXL862XX_MUX_CHANNELS) {
++		dev_err(dev, "ds-mux: invalid channel %u\n", channel);
++		return -EINVAL;
++	}
++
++	if (mux->channels[channel].pl) {
++		dev_err(dev, "ds-mux: duplicate channel %u\n", channel);
++		return -EEXIST;
++	}
++
++	ret = of_get_phy_mode(np, &phy_mode);
++	if (ret) {
++		dev_err(dev, "ds-mux: channel %u has invalid phy-mode: %pe\n",
++			channel, ERR_PTR(ret));
++		return ret;
++	}
++
++	pl = phylink_create(&mux->dp->pl_config, of_fwnode_handle(np),
++			    phy_mode, mux->priv->ds->phylink_mac_ops);
++	if (IS_ERR(pl)) {
++		ret = PTR_ERR(pl);
++		dev_err(dev, "ds-mux: failed to create channel %u phylink: %pe\n",
++			channel, ERR_PTR(ret));
++		return ret;
++	}
++
++	mux->channels[channel].np = of_node_get(np);
++	mux->channels[channel].pl = pl;
++
++	return 0;
++}
++
++static int mxl862xx_mux_add(struct mxl862xx_priv *priv,
++			    struct device_node *np)
++{
++	struct device *dev = priv->ds->dev;
++	struct device_node *child;
++	struct mxl862xx_port_mux *mux;
++	struct dsa_port *dp;
++	u32 port, sfp_channel = 0;
++	int ret;
++
++	ret = of_property_read_u32(np, "reg", &port);
++	if (ret) {
++		dev_err(dev, "ds-mux: missing port reg property\n");
++		return ret;
++	}
++
++	if (port >= MXL862XX_MAX_PORTS) {
++		dev_err(dev, "ds-mux: invalid DSA port %u\n", port);
++		return -EINVAL;
++	}
++
++	if (priv->port_muxes[port]) {
++		dev_err(dev, "ds-mux: duplicate mux for port %u\n", port);
++		return -EEXIST;
++	}
++
++	dp = dsa_to_port(priv->ds, port);
++	if (!dp) {
++		dev_err(dev, "ds-mux: DSA port %u does not exist\n", port);
++		return -ENODEV;
++	}
++
++	if (!dsa_port_is_user(dp)) {
++		dev_err(dev, "ds-mux: DSA port %u is not a user port\n", port);
++		return -EINVAL;
++	}
++
++	if (!dp->dn || !dp->pl) {
++		dev_err(dev, "ds-mux: DSA port %u has no base phylink\n", port);
++		return -EINVAL;
++	}
++
++	mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
++	if (!mux)
++		return -ENOMEM;
++
++	mux->priv = priv;
++	mux->dp = dp;
++	mux->base_dn = of_node_get(dp->dn);
++	mux->base_pl = dp->pl;
++
++	mux->mod_def0_gpio = devm_fwnode_gpiod_get_index(dev,
++					of_fwnode_handle(np), "mod-def0", 0,
++					GPIOD_IN |
++					GPIOD_FLAGS_BIT_NONEXCLUSIVE,
++					"mxl862xx-ds-mux-mod-def0");
++	if (IS_ERR(mux->mod_def0_gpio)) {
++		ret = PTR_ERR(mux->mod_def0_gpio);
++		dev_err(dev, "ds-mux: failed to request MOD_DEF0 GPIO: %pe\n",
++			ERR_PTR(ret));
++		goto err_put_base_dn;
++	}
++
++	mux->chan_sel_gpio = devm_fwnode_gpiod_get_index(dev,
++					of_fwnode_handle(np), "chan-sel", 0,
++					GPIOD_OUT_LOW,
++					"mxl862xx-ds-mux-chan-sel");
++	if (IS_ERR(mux->chan_sel_gpio)) {
++		ret = PTR_ERR(mux->chan_sel_gpio);
++		dev_err(dev, "ds-mux: failed to request channel select GPIO: %pe\n",
++			ERR_PTR(ret));
++		goto err_put_base_dn;
++	}
++
++	ret = of_property_read_u32(np, "sfp-present-channel", &sfp_channel);
++	if (ret && ret != -EINVAL) {
++		dev_err(dev, "ds-mux: invalid sfp-present-channel: %pe\n",
++			ERR_PTR(ret));
++		goto err_put_base_dn;
++	}
++
++	if (sfp_channel >= MXL862XX_MUX_CHANNELS) {
++		dev_err(dev, "ds-mux: invalid SFP-present channel %u\n",
++			sfp_channel);
++		ret = -EINVAL;
++		goto err_put_base_dn;
++	}
++
++	mux->sfp_present_channel = sfp_channel;
++	mux->active_channel = !sfp_channel;
++	gpiod_set_value_cansleep(mux->chan_sel_gpio, mux->active_channel);
++
++	for_each_available_child_of_node(np, child) {
++		ret = mxl862xx_mux_add_channel(mux, child);
++		if (ret) {
++			of_node_put(child);
++			goto err_destroy_channels;
++		}
++	}
++
++	if (!mxl862xx_mux_channel_ready(mux, 0) ||
++	    !mxl862xx_mux_channel_ready(mux, 1)) {
++		dev_err(dev, "ds-mux: port %u requires both channel 0 and 1\n",
++			port);
++		ret = -EINVAL;
++		goto err_destroy_channels;
++	}
++
++	priv->port_muxes[port] = mux;
++
++	INIT_DELAYED_WORK(&mux->work, mxl862xx_mux_work);
++	mod_delayed_work(system_wq, &mux->work, MXL862XX_MUX_START_DELAY);
++
++	dev_info(dev, "ds-mux: registered mux for DSA port %u, SFP channel %u\n",
++		 port, mux->sfp_present_channel);
++
++	return 0;
++
++err_destroy_channels:
++	mxl862xx_mux_destroy_channels(mux);
++err_put_base_dn:
++	of_node_put(mux->base_dn);
++	mux->base_dn = NULL;
++	return ret;
++}
++
++int mxl862xx_mux_init(struct mxl862xx_priv *priv)
++{
++	struct device_node *mux_bus, *child;
++	int ret = 0;
++
++	mux_bus = of_get_child_by_name(priv->ds->dev->of_node, "ds-mux-bus");
++	if (!mux_bus)
++		return 0;
++
++	for_each_available_child_of_node(mux_bus, child) {
++		if (!mxl862xx_mux_compatible(child))
++			continue;
++
++		ret = mxl862xx_mux_add(priv, child);
++		if (ret) {
++			of_node_put(child);
++			break;
++		}
++	}
++
++	of_node_put(mux_bus);
++
++	return ret;
++}
++
++void mxl862xx_mux_release_all(struct mxl862xx_priv *priv)
++{
++	struct mxl862xx_port_mux *mux;
++	int port;
++
++	for (port = 0; port < MXL862XX_MAX_PORTS; port++) {
++		mux = priv->port_muxes[port];
++		if (!mux)
++			continue;
++
++		cancel_delayed_work_sync(&mux->work);
++
++		rtnl_lock();
++		mxl862xx_mux_restore_locked(mux);
++		rtnl_unlock();
++
++		mxl862xx_mux_destroy_channels(mux);
++		of_node_put(mux->base_dn);
++		mux->base_dn = NULL;
++		mux->base_pl = NULL;
++		priv->port_muxes[port] = NULL;
++	}
++}
+--- /dev/null
++++ b/drivers/net/dsa/mxl862xx/mxl862xx-mux.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef __MXL862XX_MUX_H
++#define __MXL862XX_MUX_H
++
++struct mxl862xx_priv;
++
++int mxl862xx_mux_init(struct mxl862xx_priv *priv);
++void mxl862xx_mux_release_all(struct mxl862xx_priv *priv);
++
++#endif /* __MXL862XX_MUX_H */
