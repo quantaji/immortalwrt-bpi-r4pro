@@ -224,12 +224,12 @@
 };
 
 /*
- * TODO(vendor-convergence, Phase 9): the refreshed 6.12 image shows eth1 but
- * can fail PHY attach with -22 despite this vendor-style 10gbase-r/phy28
- * description. Keep vendor DTS semantics here; compare AS21xxx/phylink/vendor
- * Ethernet behavior instead of guessing a local mode change.
+ * The enclosure names this GMAC1/AS21xxx/SFP2 mux path "Combo WAN".
+ * Keep vendor DTS media semantics here; compare AS21xxx/phylink/vendor
+ * Ethernet behavior instead of guessing a local mode change if attach fails.
  */
 &gmac1 {
+	openwrt,netdev-name = "combo-wan";
 	phy-mode = "10gbase-r";
 	phy-connection-type = "10gbase-r";
 	phy = <&phy28>;
@@ -263,7 +263,11 @@
 	label = "lan5";
 };
 
-/* R4Pro has only port 0 connected, so disable the others */
+/*
+ * The 8X routes internal switch port 3 to the ETH8 1G FPC connector.
+ * Vendor 24.10 names this port "lan3", but current 25.12 names the
+ * MxL user ports lan1..lan4, so use the media-specific "fpc-lan".
+ */
 &gsw_phy1 {
 	status = "disabled";
 };
@@ -281,11 +285,20 @@
 };
 
 &gsw_phy3 {
-	status = "disabled";
+	pinctrl-0 = <&gbe3_led0_pins>;
+	pinctrl-names = "gbe-led";
+	status = "okay";
+};
+
+&gsw_phy3_led0 {
+	color = <LED_COLOR_ID_GREEN>;
+	function = LED_FUNCTION_LAN;
+	status = "okay";
 };
 
 &gsw_port3 {
-	status = "disabled";
+	label = "fpc-lan";
+	status = "okay";
 };
 
 &i2c0 {
@@ -600,7 +613,7 @@
 
 			port@13 {
 				reg = <13>;
-				label = "lan6";
+				label = "combo-lan";
 				phy-mode = "10gbase-r";
 				phy-connection-type = "10gbase-r";
 				phy-handle = <&phy24>;
@@ -686,6 +699,13 @@
 		mux {
 			function = "led";
 			groups = "gbe0_led0";
+		};
+	};
+
+	gbe3_led0_pins: gbe3-led0-pins {
+		mux {
+			function = "led";
+			groups = "gbe3_led0";
 		};
 	};
 
