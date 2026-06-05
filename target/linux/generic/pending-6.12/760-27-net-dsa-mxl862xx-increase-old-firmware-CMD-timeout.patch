@@ -1,0 +1,37 @@
+From: Daniel Golle <daniel@makrotopia.org>
+Date: Wed, 22 Apr 2026 15:15:52 +0100
+Subject: net: dsa: mxl862xx: increase old firmware CMD timeout
+
+Lift the command timeout by 10x from 500ms to 5s.
+This is done because older firmware can be extremely slow to respond
+and cause -ETIMEOUT during setup, or crash the PHY state machine.
+
+The BPI-R4 Pro 8X Phase 9 runtime showed MxL86252C firmware 1.0.70 and
+DSA setup timeouts while configuring the 802.1Q tag path, so keep this
+as an OpenWrt downstream old-firmware compatibility patch rather than a
+firmware update requirement.
+
+Source: OpenWrt PR #21083 pending patch
+  refs/upstream/openwrt-main-pr21083/target/linux/generic/pending-6.12/
+  760-27-DO-NOT-SUBMIT-net-dsa-mxl862xx-increase-CMD-timeout.patch
+Behavior source: BPI-R4 Pro 8X Phase 9 runtime evidence with MxL86252C
+firmware 1.0.70 and -ETIMEDOUT during DSA setup.
+Adapted-for: ImmortalWrt 25.12 / Linux 6.12.91 BPI-R4 Pro 8X Phase 9
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+
+Signed-off-by: Daniel Golle <daniel@makrotopia.org>
+---
+ drivers/net/dsa/mxl862xx/mxl862xx-host.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/dsa/mxl862xx/mxl862xx-host.c
++++ b/drivers/net/dsa/mxl862xx/mxl862xx-host.c
+@@ -207,7 +207,7 @@ static int mxl862xx_busy_wait(struct mxl
+ 	int val;
+ 
+ 	return readx_poll_timeout(mxl862xx_ctrl_read, priv, val,
+-				  !(val & CTRL_BUSY_MASK), 15, 500000);
++				  !(val & CTRL_BUSY_MASK), 50, 5000000);
+ }
+ 
+ /* Issue a firmware command with CRC-6 protection on the ctrl and len_ret

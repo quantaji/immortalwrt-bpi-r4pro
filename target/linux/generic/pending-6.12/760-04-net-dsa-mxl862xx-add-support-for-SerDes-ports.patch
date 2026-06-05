@@ -30,8 +30,9 @@ Signed-off-by: Daniel Golle <daniel@makrotopia.org>
 Source: OpenWrt PR #21083 (refs/upstream/openwrt-main-pr21083).
 
 [OpenAI ChatGPT/Codex (GPT-5): imported from OpenWrt PR #21083 and
-staged for ImmortalWrt 25.12 / Linux 6.12.91. No semantic change intended
-unless explicitly noted in a later local patch.]
+staged for ImmortalWrt 25.12 / Linux 6.12.91. Locally adapted to carry
+the OpenWrt PR #23477 review fix which propagates negative XPCS firmware
+configuration results instead of reporting them as success.]
 ---
  drivers/net/dsa/mxl862xx/mxl862xx-api.h     | 474 +++++++++++++++++++-
  drivers/net/dsa/mxl862xx/mxl862xx-cmd.h     |  13 +
@@ -582,7 +583,7 @@ unless explicitly noted in a later local patch.]
  #include "mxl862xx-phylink.h"
  
  void mxl862xx_phylink_get_caps(struct dsa_switch *ds, int port,
-@@ -19,8 +23,393 @@ void mxl862xx_phylink_get_caps(struct ds
+@@ -19,8 +23,412 @@ void mxl862xx_phylink_get_caps(struct ds
  	config->mac_capabilities = MAC_ASYM_PAUSE | MAC_SYM_PAUSE | MAC_10 |
  				   MAC_100 | MAC_1000 | MAC_2500FD;
  
@@ -651,6 +652,22 @@ unless explicitly noted in a later local patch.]
 +	if (neg_mode & PHYLINK_PCS_NEG_ENABLED)
 +		return MXL862XX_XPCS_NEG_INBAND_AN_ON;
 +	return MXL862XX_XPCS_NEG_INBAND_AN_OFF;
++}
++
++/* The XPCS firmware reports failures in the result field using its own
++ * libc errno values; ENOTSUP (134) in particular has no kernel errno.
++ * Translate the codes the firmware can actually return.
++ */
++static int mxl862xx_xpcs_errno(int result)
++{
++	switch (result) {
++	case -5: /* firmware -EIO */
++		return -EIO;
++	case -134: /* firmware -ENOTSUP */
++		return -EOPNOTSUPP;
++	default: /* firmware -EINVAL and anything unexpected */
++		return -EINVAL;
++	}
 +}
 +
 +static struct mxl862xx_xpcs_signal_detect
@@ -779,8 +796,11 @@ unless explicitly noted in a later local patch.]
 +	if (ret)
 +		return ret;
 +
++	ret = (s16)le16_to_cpu(cfg.result);
++	if (ret < 0)
++		return mxl862xx_xpcs_errno(ret);
 +	/* result > 0 means AN restart is needed */
-+	return le16_to_cpu(cfg.result) > 0 ? 1 : 0;
++	return ret > 0 ? 1 : 0;
 +}
 +
 +static void mxl862xx_xpcs_decode_speed(u16 fw_speed,
@@ -978,7 +998,7 @@ unless explicitly noted in a later local patch.]
  }
  
  static void mxl862xx_phylink_mac_config(struct phylink_config *config,
-@@ -48,4 +437,5 @@ const struct phylink_mac_ops mxl862xx_ph
+@@ -48,4 +456,5 @@ const struct phylink_mac_ops mxl862xx_ph
  	.mac_config = mxl862xx_phylink_mac_config,
  	.mac_link_down = mxl862xx_phylink_mac_link_down,
  	.mac_link_up = mxl862xx_phylink_mac_link_up,
