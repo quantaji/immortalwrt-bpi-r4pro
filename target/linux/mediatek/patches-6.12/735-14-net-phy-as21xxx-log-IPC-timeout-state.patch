@@ -1,0 +1,70 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: log IPC timeout state for diagnosis
+
+The BPI-R4 Pro 8X runtime still reports intermittent AS21xxx IPC command
+timeouts while polling the firmware-version readiness path:
+
+  aeon_ipc_wait_cmd failed: -110
+  failed to send ipc msg for 1: -110
+
+The direct failing command is IPC_CMD_INFO, but the current log does not
+show whether the firmware IPC status register is stuck on an old parity,
+busy/process state, wrong opcode, or another terminal state.  Add a
+diagnostic timeout log that prints the command and the last observed
+VEND1_IPC_STS fields.
+
+This is intentionally diagnostics-only: it does not change the IPC
+timeout, readiness condition, retry policy, firmware loading, or link
+configuration behavior.
+
+Instrumented-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -492,17 +492,30 @@ static bool aeon_ipc_ready(u16 val, bool
+ 	       status != AEON_IPC_STS_STATUS_BUSY;
+ }
+ 
+-static int aeon_ipc_wait_cmd(struct phy_device *phydev, bool parity_status)
++static int aeon_ipc_wait_cmd(struct phy_device *phydev, u16 cmd,
++			     bool parity_status)
+ {
+ 	u16 val;
++	int ret;
+ 
+ 	/* Exit condition logic:
+ 	 * - Wait for parity bit equal
+ 	 * - Wait for status success, error OR ready
+ 	 */
+-	return phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1, VEND1_IPC_STS, val,
+-					 aeon_ipc_ready(val, parity_status),
+-					 AEON_IPC_DELAY, AEON_IPC_TIMEOUT, false);
++	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1, VEND1_IPC_STS, val,
++					aeon_ipc_ready(val, parity_status),
++					AEON_IPC_DELAY, AEON_IPC_TIMEOUT, false);
++	if (ret == -ETIMEDOUT)
++		phydev_err(phydev,
++			   "IPC timeout state: cmd=0x%04x cmd_opcode=0x%02x expected_parity=%u sts=0x%04x sts_opcode=0x%02x sts_status=0x%x sts_parity=%u sts_size=%u\n",
++			   cmd, (unsigned int)FIELD_GET(AEON_IPC_CMD_OPCODE, cmd),
++			   parity_status, val,
++			   (unsigned int)FIELD_GET(AEON_IPC_STS_OPCODE, val),
++			   (unsigned int)FIELD_GET(AEON_IPC_STS_STATUS, val),
++			   (unsigned int)FIELD_GET(AEON_IPC_STS_PARITY, val),
++			   (unsigned int)FIELD_GET(AEON_IPC_STS_SIZE, val));
++
++	return ret;
+ }
+ 
+ static int aeon_ipc_send_cmd(struct phy_device *phydev,
+@@ -536,7 +549,7 @@ static int aeon_ipc_send_cmd(struct phy_
+ 	if (!ret_sts)
+ 		return 0;
+ 
+-	ret = aeon_ipc_wait_cmd(phydev, curr_parity);
++	ret = aeon_ipc_wait_cmd(phydev, cmd, curr_parity);
+ 	if (ret)
+ 		return ret;
+ 
