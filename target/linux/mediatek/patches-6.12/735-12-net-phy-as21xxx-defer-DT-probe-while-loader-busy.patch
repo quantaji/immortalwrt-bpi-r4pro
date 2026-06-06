@@ -1,0 +1,73 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: defer DT probe while firmware loader is busy
+
+Runtime on r0+37893-6f8eae077c shows the BPI-R4 Pro 8X LAN-side
+AS21010PB1 still being selected too early:
+
+  Aeonsemi AS21010PB1 mdio-bus:18: firmware loader busy, retrying for up to 15000 ms
+  Aeonsemi AS21010PB1 mdio-bus:18: firmware loader stayed busy after 15000 ms
+  Aeonsemi AS21010PB1 mdio-bus:18: probe ... failed with error -22
+
+After that hard probe failure, the same MDIO device is claimed by the
+Generic Clause 45 PHY driver and never gets another AS21xxx probe.  The
+WAN-side AS21010PB1 then succeeds a few seconds later, which means the
+problem is not a missing firmware blob or a permanently dead PHY; the
+driver returned a permanent error for a temporary loader-busy condition.
+
+Use the kernel's normal probe-deferral mechanism for this case.  Keep a
+short local retry window for transient loader races, then return
+-EPROBE_DEFER from probe if the loader is still busy.  This prevents the
+Generic Clause 45 fallback from permanently stealing the DT-declared
+AS21010PB1 node and lets the driver core retry the concrete AS21xxx
+driver after the rest of the MDIO/DSA stack has progressed.
+
+This does not hide persistent failure: repeated deferred probes will
+still log the busy state, and non-busy firmware/IPC errors keep returning
+their real error code.
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -196,7 +196,7 @@
+ #define AEON_IPC_TIMEOUT		(AEON_IPC_DELAY * 200)
+ 
+ #define AEON_FW_LOAD_RETRY_DELAY_MS	500
+-#define AEON_FW_LOAD_RETRY_TIMEOUT_MS	15000
++#define AEON_FW_LOAD_RETRY_TIMEOUT_MS	3000
+ #define AEON_IPC_DATA_NUM_REGISTERS	8
+ #define AEON_IPC_DATA_MAX		(AEON_IPC_DATA_NUM_REGISTERS * sizeof(u16))
+ 
+@@ -466,7 +466,7 @@
+ 	if (ret == -EBUSY) {
+ 		phydev_err(phydev, "firmware loader stayed busy after %u ms\n",
+ 			   elapsed_ms);
+-		return -EINVAL;
++		return -EBUSY;
+ 	}
+ 
+ 	if (ret)
+@@ -727,6 +727,8 @@
+ 			    "firmware IPC not ready during config_init, reloading\n");
+ 
+ 		ret = aeon_firmware_load_wait(phydev);
++		if (ret == -EBUSY)
++			return -ENODEV;
+ 		if (ret)
+ 			return ret;
+ 
+@@ -777,6 +779,11 @@
+ 	    of_find_property(phydev->mdio.dev.of_node,
+ 			     "firmware-name", NULL)) {
+ 		ret = aeon_firmware_load_wait(phydev);
++		if (ret == -EBUSY) {
++			phydev_warn(phydev,
++				    "firmware loader still busy, deferring probe\n");
++			return -EPROBE_DEFER;
++		}
+ 		if (ret)
+ 			return ret;
+ 	}
