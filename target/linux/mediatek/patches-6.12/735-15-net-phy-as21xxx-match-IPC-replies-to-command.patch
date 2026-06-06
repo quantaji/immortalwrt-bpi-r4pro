@@ -1,9 +1,8 @@
 From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
 Subject: [PATCH] net: phy: as21xxx: match IPC replies to the active command
 
-BPI-R4 Pro 8X diagnostic runtime with the previous IPC state logging
-proved that the remaining AS21xxx -ETIMEDOUT reports are not a generic
-firmware-busy condition:
+BPI-R4 Pro 8X diagnostic runtime proved that the remaining AS21xxx
+-ETIMEDOUT reports were not a generic firmware-busy condition:
 
   cmd=0x8081 cmd_opcode=0x01 expected_parity=1
   sts=0x01a4 sts_opcode=0x1a sts_status=0x4 sts_parity=0 sts_size=0
@@ -27,19 +26,20 @@ USXGMII.  Keeping CFG_PARAM out of probe avoids leaving a CFG_PARAM
 success status immediately before phylib config_init polls firmware
 version.
 
-Runtime evidence: BPI-R4 Pro 8X r0+37898-59b64b53ce diagnostic log.
+Runtime evidence: BPI-R4 Pro 8X r0+37898-59b64b53ce diagnostic log and
+r0+37899-d1d992ce41 fixed-image validation.
 Vendor sequencing source: Banana Pi BPI-R4 Pro 8X OpenWrt 24.10
 as21xxx.c as21xxx_probe() and as21xxx_config_init().
 
 Diagnosed-by: OpenAI ChatGPT/Codex (GPT-5)
 Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
 ---
- drivers/net/phy/as21xxx.c | 55 ++++++++++++++++++++++++++++----------
- 1 file changed, 41 insertions(+), 14 deletions(-)
+ drivers/net/phy/as21xxx.c | 59 +++++++++++++++++++++++++++++---------
+ 1 file changed, 46 insertions(+), 13 deletions(-)
 
 --- a/drivers/net/phy/as21xxx.c
 +++ b/drivers/net/phy/as21xxx.c
-@@ -478,18 +478,27 @@ static int aeon_firmware_load_wait(struc
+@@ -478,30 +478,41 @@
  	return 0;
  }
  
@@ -71,8 +71,11 @@ Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
 +	return sts_opcode == cmd_opcode;
  }
  
- static int aeon_ipc_wait_cmd(struct phy_device *phydev, u16 cmd,
-@@ -500,10 +509,11 @@ static int aeon_ipc_wait_cmd(struct phy_
+-static int aeon_ipc_wait_cmd(struct phy_device *phydev, bool parity_status)
++static int aeon_ipc_wait_cmd(struct phy_device *phydev, u16 cmd,
++			     bool parity_status)
+ {
+ 	u16 val;
  
  	/* Exit condition logic:
  	 * - Wait for parity bit equal
@@ -80,13 +83,22 @@ Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
 +	 * - Wait for the active command opcode on success or error
 +	 * - Accept ready only for NOOP parity sync
  	 */
- 	ret = phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1, VEND1_IPC_STS, val,
--					aeon_ipc_ready(val, parity_status),
-+					aeon_ipc_ready(val, cmd, parity_status),
- 					AEON_IPC_DELAY, AEON_IPC_TIMEOUT, false);
- 	if (ret == -ETIMEDOUT)
- 		phydev_err(phydev,
-@@ -584,15 +594,21 @@ static int aeon_ipc_send_msg(struct phyd
+ 	return phy_read_mmd_poll_timeout(phydev, MDIO_MMD_VEND1, VEND1_IPC_STS, val,
+-					 aeon_ipc_ready(val, parity_status),
++					 aeon_ipc_ready(val, cmd, parity_status),
+ 					 AEON_IPC_DELAY, AEON_IPC_TIMEOUT, false);
+ }
+ 
+@@ -536,7 +547,7 @@
+ 	if (!ret_sts)
+ 		return 0;
+ 
+-	ret = aeon_ipc_wait_cmd(phydev, curr_parity);
++	ret = aeon_ipc_wait_cmd(phydev, cmd, curr_parity);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -571,15 +582,21 @@
  	if (data_len > AEON_IPC_DATA_MAX)
  		return -EINVAL;
  
@@ -113,7 +125,7 @@ Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
  	ret = aeon_ipc_send_cmd(phydev, priv, cmd, &ret_sts);
  	if (ret) {
  		phydev_err(phydev, "failed to send ipc msg for %x: %d\n",
-@@ -600,7 +616,7 @@ static int aeon_ipc_send_msg(struct phyd
+@@ -587,7 +604,7 @@
  		goto out;
  	}
  
@@ -122,7 +134,7 @@ Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
  		goto out;
  
  	if ((ret_sts & AEON_IPC_STS_STATUS) == AEON_IPC_STS_STATUS_ERROR) {
-@@ -705,6 +721,18 @@ static int aeon_ipc_get_fw_version(struc
+@@ -692,6 +709,18 @@
  	return 0;
  }
  
@@ -141,7 +153,7 @@ Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
  static int aeon_dpc_ra_enable(struct phy_device *phydev)
  {
  	u16 data[2];
-@@ -718,14 +746,9 @@ static int aeon_dpc_ra_enable(struct phy
+@@ -705,14 +734,9 @@
  
  static int aeon_wait_reset_complete(struct phy_device *phydev)
  {
@@ -157,7 +169,7 @@ Signed-off-by: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
  				 ret == 0, AEON_IPC_DELAY,
  				 AEON_IPC_TIMEOUT, false, phydev);
  }
-@@ -815,7 +838,7 @@ static int as21xxx_probe(struct phy_devi
+@@ -802,7 +826,7 @@
  	if (ret)
  		return ret;
  
