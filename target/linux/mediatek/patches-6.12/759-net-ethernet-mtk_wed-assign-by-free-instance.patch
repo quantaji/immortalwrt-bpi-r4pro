@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 6 Jun 2026 00:00:00 +0000
+Subject: [PATCH] net: ethernet: mtk_wed: assign WED by free instance
+
+The official BPI-R4 Pro 8X vendor tree carries a WED attach fix that stops
+selecting the WED instance directly from the WLAN PCI domain number. On
+MT7988/BPI-R4 Pro class boards this avoids rejecting otherwise valid WLAN
+PCIe devices and lets the driver bind to the first free WED instance.
+
+Vendor source:
+refs/vendor/bpi-r4pro-8x-openwrt24.10/target/linux/mediatek/patches-6.6/
+999-3022-refactor-mtk_wed_assgin-not-base-on-pci-domain.patch
+
+Adapted for ImmortalWrt 25.12 / Linux 6.12 by OpenAI ChatGPT/Codex (GPT-5).
+
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+Signed-off-by: Codex <codex@local>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 31 +++++++-----------------
+ 1 file changed, 9 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -495,34 +495,21 @@ void mtk_wed_fe_reset_complete(void)
+ static struct mtk_wed_hw *
+ mtk_wed_assign(struct mtk_wed_device *dev)
+ {
+-	struct mtk_wed_hw *hw;
+ 	int i;
+ 
+-	if (dev->wlan.bus_type == MTK_WED_BUS_PCIE) {
+-		hw = hw_list[pci_domain_nr(dev->wlan.pci_dev->bus)];
+-		if (!hw)
+-			return NULL;
++	for (i = 0; i < ARRAY_SIZE(hw_list); i++) {
++		struct mtk_wed_hw *hw = hw_list[i];
+ 
+-		if (!hw->wed_dev)
+-			goto out;
++		if (!hw || hw->wed_dev)
++			continue;
+ 
+-		if (mtk_wed_is_v1(hw))
+-			return NULL;
++		hw->wed_dev = dev;
++		hw->pcie_base = MTK_WED_PCIE_BASE;
+ 
+-		/* MT7986 WED devices do not have any pcie slot restrictions */
+-	}
+-	/* MT7986 PCIE or AXI */
+-	for (i = 0; i < ARRAY_SIZE(hw_list); i++) {
+-		hw = hw_list[i];
+-		if (hw && !hw->wed_dev)
+-			goto out;
++		return hw;
+ 	}
+ 
+ 	return NULL;
+-
+-out:
+-	hw->wed_dev = dev;
+-	return hw;
+ }
+ 
+ static int
+@@ -2440,9 +2427,7 @@ int mtk_wed_attach(struct mtk_wed_device
+ 	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
+ 			 "mtk_wed_attach without holding the RCU read lock");
+ 
+-	if ((dev->wlan.bus_type == MTK_WED_BUS_PCIE &&
+-	     pci_domain_nr(dev->wlan.pci_dev->bus) > 1) ||
+-	    !try_module_get(THIS_MODULE))
++	if (!try_module_get(THIS_MODULE))
+ 		ret = -ENODEV;
+ 
+ 	rcu_read_unlock();
