@@ -1,0 +1,98 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: add vendor autoneg configuration
+
+Runtime on BPI-R4 Pro 8X r0+37894-5932d307b3 shows both external
+AS21010PB1 PHYs finally binding to the concrete AS21xxx driver, but
+starting combo-wan still reports:
+
+  _phy_start_aneg+0x0/0x98: returned: -22
+
+The final AS21010PB1 driver entry has no .config_aneg callback, so
+phy_config_aneg() falls through to generic Clause 45 autoneg handling.
+The vendor AS21xxx driver provides an AS21xxx-specific .config_aneg for
+all model entries, including AS21010PB1.  Its autoneg configuration
+writes the standard AN advertisement and 10GBASE-T control registers,
+then checks/restarts AN, but intentionally does not run the wider generic
+C45 autoneg setup path.
+
+Add the same AS21xxx-specific autoneg path while keeping the current
+Linux 6.12 helpers for forced speed setup and AN restart.  This keeps
+AS21xxx bound to its model driver through link startup instead of relying
+on the generic C45 fallback that fails at runtime on the 8X WAN-side PHY.
+
+Source: refs/vendor/bpi-r4pro-8x-openwrt24.10/package/kernel/as21xxx/source/as21xxx.c
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 52 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -930,6 +930,57 @@ static int as21xxx_get_features(struct p
+ 	return 0;
+ }
+ 
++static int as21xxx_an_config_aneg(struct phy_device *phydev)
++{
++	int changed = 0, ret;
++	u32 adv;
++
++	linkmode_and(phydev->advertising, phydev->advertising,
++		     phydev->supported);
++
++	adv = linkmode_adv_to_mii_adv_t(phydev->advertising);
++
++	ret = phy_modify_mmd(phydev, MDIO_MMD_AN, MDIO_AN_ADVERTISE,
++			     ADVERTISE_ALL | ADVERTISE_100BASE4 |
++			     ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM,
++			     adv);
++	if (ret < 0)
++		return ret;
++	if (ret > 0)
++		changed = 1;
++
++	adv = linkmode_adv_to_mii_10gbt_adv_t(phydev->advertising);
++
++	ret = phy_modify_mmd(phydev, MDIO_MMD_AN, MDIO_AN_10GBT_CTRL,
++			     MDIO_AN_10GBT_CTRL_ADV10G |
++			     MDIO_AN_10GBT_CTRL_ADV5G |
++			     MDIO_AN_10GBT_CTRL_ADV2_5G,
++			     adv);
++	if (ret < 0)
++		return ret;
++	if (ret > 0)
++		changed = 1;
++
++	return changed;
++}
++
++static int as21xxx_config_aneg(struct phy_device *phydev)
++{
++	bool changed = false;
++	int ret;
++
++	if (phydev->autoneg == AUTONEG_DISABLE)
++		return genphy_c45_pma_setup_forced(phydev);
++
++	ret = as21xxx_an_config_aneg(phydev);
++	if (ret < 0)
++		return ret;
++	if (ret > 0)
++		changed = true;
++
++	return genphy_c45_check_and_restart_aneg(phydev, changed);
++}
++
+ static int as21xxx_read_status(struct phy_device *phydev)
+ {
+ 	int bmcr, old_link = phydev->link;
+@@ -1285,8 +1336,9 @@ static struct phy_driver as21xxx_drivers
+ 		.name		= "Aeonsemi AS21010PB1",
+ 		.probe		= as21xxx_probe,
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_aneg	= as21xxx_config_aneg,
+ 		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
