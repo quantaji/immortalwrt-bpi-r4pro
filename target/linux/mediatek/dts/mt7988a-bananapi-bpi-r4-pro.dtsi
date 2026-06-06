@@ -453,9 +453,15 @@
 &mdio_bus {
 	clock-frequency = <12500000>;
 
-	/* external Airoha AN8831X connected to the MxL86252C combo LAN path */
+	/* external Aeonsemi AS21010PB1 connected to the MxL86252C combo LAN path */
 	phy24: ethernet-phy@24 {
-		compatible = "ethernet-phy-ieee802.3-c45";
+		/*
+		 * Keep the generic C45 compatible for bus probing and add
+		 * the fixed AS21010PB1 ID for the AS21xxx driver's early
+		 * firmware/ID fallback.
+		 */
+		compatible = "ethernet-phy-id7500.9432",
+			     "ethernet-phy-ieee802.3-c45";
 		reg = <24>;
 		reset-gpios = <&pio 83 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <200000>;
@@ -483,7 +489,8 @@
 	};
 
 	phy28: ethernet-phy@28 {
-		compatible = "ethernet-phy-ieee802.3-c45";
+		compatible = "ethernet-phy-id7500.9432",
+			     "ethernet-phy-ieee802.3-c45";
 		reg = <28>;
 		reset-gpios = <&pio 82 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <200000>;

@@ -1,0 +1,146 @@
+From: OpenAI ChatGPT/Codex (GPT-5)
+Subject: net: phy: as21xxx: bind DT-declared PHY IDs when C45 IDs are empty
+
+BPI-R4 Pro 8X runtime shows the two external AS21010PB1 PHYs created as
+Clause 45 devices with empty IDs:
+
+  mdio-bus:18 phy_id 0x00000000 OF_COMPATIBLE_0=ethernet-phy-ieee802.3-c45 no DRIVER
+  mdio-bus:1c phy_id 0x00000000 OF_COMPATIBLE_0=ethernet-phy-ieee802.3-c45 no DRIVER
+
+The AS21xxx module is loaded in that image, but as21xxx_match_phy_device()
+hands an empty vendor ID to the generic C45 PHY driver before the AS21xxx
+firmware pre-pass or model-specific entries can run.  The later
+.get_features fix therefore never executes, leaving phylink with a
+speed-less supported mask and causing combo-wan/combo-lan validation
+failures.
+
+Allow the AS21xxx driver to use a fixed ethernet-phy-id compatible from
+the device tree as an early fallback.  The fallback is only used when the
+hardware ID read is empty/all-ones or agrees with the DT-declared model;
+real conflicting hardware IDs still win.  This keeps the board-specific
+knowledge in DTS and the binding behavior in the PHY driver, instead of
+hardcoding a board name.
+
+Source: local BPI-R4 Pro 8X Phase 9.8 runtime evidence
+Behavior source: OpenWrt PR #21083 board description identifies the 8X
+variant as using 2x Aeonsemi AS21010P 10G PHYs, and earlier project
+runtime identified AS21010PB1 on the WAN path.
+Adapted-for: ImmortalWrt 25.12 / Linux 6.12.91 mediatek/filogic
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 66 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 62 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -141,6 +141,54 @@
+ #define PHY_ID_AS21210PB1		0x75009492
+ #define PHY_VENDOR_AEONSEMI		0x75009400
+ 
++struct as21xxx_dt_phy_id {
++	u32 phy_id;
++	const char *compatible;
++};
++
++static const struct as21xxx_dt_phy_id as21xxx_dt_phy_ids[] = {
++	{ PHY_ID_AS21011JB1, "ethernet-phy-id7500.9402" },
++	{ PHY_ID_AS21011PB1, "ethernet-phy-id7500.9412" },
++	{ PHY_ID_AS21010JB1, "ethernet-phy-id7500.9422" },
++	{ PHY_ID_AS21010PB1, "ethernet-phy-id7500.9432" },
++	{ PHY_ID_AS21511JB1, "ethernet-phy-id7500.9442" },
++	{ PHY_ID_AS21511PB1, "ethernet-phy-id7500.9452" },
++	{ PHY_ID_AS21510JB1, "ethernet-phy-id7500.9462" },
++	{ PHY_ID_AS21510PB1, "ethernet-phy-id7500.9472" },
++	{ PHY_ID_AS21210JB1, "ethernet-phy-id7500.9482" },
++	{ PHY_ID_AS21210PB1, "ethernet-phy-id7500.9492" },
++};
++
++static bool as21xxx_phy_id_empty(u32 phy_id)
++{
++	return !phy_id || phy_id == 0xffffffff;
++}
++
++static u32 as21xxx_dt_phy_id(struct phy_device *phydev)
++{
++	struct device_node *np = phydev->mdio.dev.of_node;
++	unsigned int i;
++
++	if (!np)
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(as21xxx_dt_phy_ids); i++)
++		if (of_device_is_compatible(np,
++					    as21xxx_dt_phy_ids[i].compatible))
++			return as21xxx_dt_phy_ids[i].phy_id;
++
++	return 0;
++}
++
++static u32 as21xxx_resolved_phy_id(struct phy_device *phydev)
++{
++	if (!as21xxx_phy_id_empty(phydev->phy_id) &&
++	    phydev->phy_id != PHY_ID_AS21XXX)
++		return phydev->phy_id;
++
++	return as21xxx_dt_phy_id(phydev);
++}
++
+ #define AEON_MAX_LEDS			5
+ #define AEON_IPC_DELAY			10000
+ #define AEON_IPC_TIMEOUT		(AEON_IPC_DELAY * 100)
+@@ -747,7 +791,7 @@ static int as21xxx_get_features(struct p
+ 	linkmode_set_bit(ETHTOOL_LINK_MODE_1000baseT_Full_BIT,
+ 			 phydev->supported);
+ 
+-	switch (phydev->phy_id) {
++	switch (as21xxx_resolved_phy_id(phydev)) {
+ 	case PHY_ID_AS21011JB1:
+ 	case PHY_ID_AS21011PB1:
+ 	case PHY_ID_AS21010JB1:
+@@ -959,11 +1003,14 @@ static int as21xxx_match_phy_device(stru
+ 	struct as21xxx_priv *priv;
+ 	u16 ret_sts;
+ 	u32 phy_id;
++	u32 dt_phy_id;
+ 	int ret;
+ 
++	dt_phy_id = as21xxx_dt_phy_id(phydev);
++
+ 	/* Skip PHY that are not AS21xxx */
+ 	if (!phy_id_compare_vendor(phydev->c45_ids.device_ids[MDIO_MMD_PCS],
+-				   PHY_VENDOR_AEONSEMI))
++				   PHY_VENDOR_AEONSEMI) && !dt_phy_id)
+ 		return genphy_match_phy_device(phydev, phydrv);
+ 
+ 	/* Read PHY ID to handle firmware loaded or HW reset */
+@@ -982,8 +1030,28 @@ static int as21xxx_match_phy_device(stru
+ 	 * the firmware just loaded
+ 	 */
+-	if (phy_id != PHY_ID_AS21XXX)
+-		return phy_id == phydrv->phy_id;
++	if (phy_id != PHY_ID_AS21XXX) {
++		if (dt_phy_id) {
++			if (as21xxx_phy_id_empty(phy_id) &&
++			    phydrv->phy_id == PHY_ID_AS21XXX)
++				goto load_firmware;
++
++			if ((as21xxx_phy_id_empty(phy_id) ||
++			     phy_id == dt_phy_id) &&
++			    dt_phy_id == phydrv->phy_id) {
++				phydev->phy_id = dt_phy_id;
++				return 1;
++			}
++		}
++
++		if (phy_id == phydrv->phy_id) {
++			phydev->phy_id = phy_id;
++			return 1;
++		}
++
++		return 0;
++	}
+ 
++load_firmware:
+ 	/* Allocate temp priv and load the firmware */
+ 	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
