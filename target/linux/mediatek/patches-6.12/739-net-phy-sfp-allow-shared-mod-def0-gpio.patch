@@ -1,0 +1,40 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: sfp: allow shared MOD_DEF0 GPIO users
+
+The BPI-R4 Pro 8X LAN-side combo path exposes the SFP1 MOD_DEF0 presence
+line both to the generic SFP cage and to the MxL86252C DSA-side mux.  The
+mux uses the same read-only presence signal to choose between the SFP and
+copper PHY channels.
+
+Runtime evidence on the 8X shows the mux probing first and successfully
+requesting GPIO69 as a non-exclusive input:
+
+  mxl862xx mdio-bus:10: ds-mux: registered mux for DSA port 13, SFP channel 0
+  gpio-581 ( |mxl862xx-ds-mux-mod-) in hi ACTIVE LOW
+
+The later SFP1 probe then fails with -EBUSY because sfp.c requests the
+same MOD_DEF0 line as an exclusive GPIOD_IN consumer:
+
+  sfp sfp1: probe with driver sfp failed with error -16
+
+MOD_DEF0 is an input-only module-present signal, so allow it to use the
+kernel's existing non-exclusive GPIO consumer mechanism.  Leave the other
+SFP GPIOs unchanged: LOS and TX_FAULT are not shared on this board, and
+the output/control GPIOs must remain exclusive.
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/sfp.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/phy/sfp.c
++++ b/drivers/net/phy/sfp.c
+@@ -156,7 +156,7 @@ static const char *gpio_names[] = {
+ };
+ 
+ static const enum gpiod_flags gpio_flags[] = {
+-	GPIOD_IN,
++	GPIOD_IN | GPIOD_FLAGS_BIT_NONEXCLUSIVE,
+ 	GPIOD_IN,
+ 	GPIOD_IN,
+ 	GPIOD_ASIS,
