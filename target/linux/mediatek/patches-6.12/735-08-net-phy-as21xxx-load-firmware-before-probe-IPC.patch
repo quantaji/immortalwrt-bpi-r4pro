@@ -1,0 +1,46 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: load firmware before probe IPC sync
+
+The BPI-R4 Pro 8X AS21010PB1 PHYs can expose empty C45 IDs before the
+firmware path has settled.  After the DT-declared PHY ID fallback lets the
+AS21010PB1 entry bind directly, probe reaches aeon_ipc_sync_parity()
+without first running the generic AS21xxx firmware pre-pass.
+
+Runtime on r0+37889-d91102e6e4 shows exactly that failure:
+
+  mdio_bus mdio-bus:1c: Invalid IPC status on sync parity: 0
+  Aeonsemi AS21010PB1 mdio-bus:1c: aeon_ipc_wait_cmd failed: -110
+  Aeonsemi AS21010PB1 mdio-bus:1c: probe ... failed with error -110
+
+The vendor AS21xxx driver loads firmware at the start of probe before
+synchronizing IPC.  Preserve the upstream-style generic firmware pre-pass,
+but also load firmware in probe when the DT node explicitly provides a
+firmware-name.  This keeps non-firmware-described AS21xxx users on the
+existing path while restoring the vendor-required ordering for BPI-R4 Pro
+8X.
+
+Behavior source: Banana Pi BPI-R4 Pro 8X vendor as21xxx.c probe path and
+local r0+37889-d91102e6e4 serial runtime evidence.
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -643,6 +643,14 @@ static int as21xxx_probe(struct phy_devi
+ 	 */
+ 	phydev->c45_ids.devices_in_package &= ~BIT(0);
+ 
++	if (phydev->mdio.dev.of_node &&
++	    of_find_property(phydev->mdio.dev.of_node,
++			     "firmware-name", NULL)) {
++		ret = aeon_firmware_load(phydev);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = aeon_ipc_sync_parity(phydev, priv);
+ 	if (ret)
+ 		return ret;
