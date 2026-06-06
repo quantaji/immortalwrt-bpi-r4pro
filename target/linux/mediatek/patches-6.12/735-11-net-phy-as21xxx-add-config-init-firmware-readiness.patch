@@ -1,0 +1,178 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: add config_init firmware readiness fallback
+
+The BPI-R4 Pro 8X vendor AS21xxx driver does not assume that a PHY
+which reached probe will remain IPC-ready for later phylib init.  Its
+config_init path polls firmware version through IPC and reloads the
+AS21xxx firmware if the firmware does not answer.
+
+That protects against reset/order cases that happen after initial MDIO
+enumeration: the MDIO device may still exist, but the embedded firmware
+may not yet be alive, may have restarted, or may have lost IPC parity
+state before phylib configures the link.
+
+Adapt the same runtime guard to the current 6.12 AS21xxx driver without
+copying the vendor debugfs or board-specific LED policy.  Sync IPC
+parity, poll firmware version for the existing two-second IPC budget, and
+retry firmware load once when the firmware does not answer.  Re-enable
+PTP clock and USXGMII DPC RA after the guard, matching the probe-time
+runtime setup already present in this driver.
+
+This is a second-layer guard.  It does not replace the firmware-loader
+busy retry used during DT firmware load; it handles the later
+config_init/readiness case once the concrete AS21xxx driver is already
+bound.
+
+Behavior source: Banana Pi BPI-R4 Pro 8X vendor as21xxx.c
+as21xxx_config_init() / aeon_wait_reset_complete() behavior, adapted for
+the current ImmortalWrt 25.12 Linux 6.12 AS21xxx driver organization.
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 64 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -8,6 +8,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
+ #include <linux/firmware.h>
++#include <linux/iopoll.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/phy.h>
+@@ -702,6 +703,53 @@
+ 				 sizeof(data), NULL);
+ }
+ 
++static int aeon_wait_reset_complete(struct phy_device *phydev)
++{
++	struct as21xxx_priv *priv = phydev->priv;
++	int ret;
++
++	ret = aeon_ipc_sync_parity(phydev, priv);
++	if (ret)
++		return ret;
++
++	return read_poll_timeout(aeon_ipc_get_fw_version, ret,
++				 ret == 0, AEON_IPC_DELAY,
++				 AEON_IPC_TIMEOUT, false, phydev);
++}
++
++static int as21xxx_config_init(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = aeon_wait_reset_complete(phydev);
++	if (ret) {
++		phydev_warn(phydev,
++			    "firmware IPC not ready during config_init, reloading\n");
++
++		ret = aeon_firmware_load_wait(phydev);
++		if (ret)
++			return ret;
++
++		ret = aeon_wait_reset_complete(phydev);
++		if (ret) {
++			phydev_err(phydev,
++				   "firmware IPC still not ready after reload: %d\n",
++				   ret);
++			return -ENODEV;
++		}
++	}
++
++	ret = phy_set_bits_mmd(phydev, MDIO_MMD_VEND1, VEND1_PTP_CLK,
++			       VEND1_PTP_CLK_EN);
++	if (ret)
++		return ret;
++
++	if (phydev->interface == PHY_INTERFACE_MODE_USXGMII)
++		ret = aeon_dpc_ra_enable(phydev);
++
++	return ret;
++}
++
+ static int as21xxx_probe(struct phy_device *phydev)
+ {
+ 	struct as21xxx_priv *priv;
+@@ -1200,6 +1248,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1215,6 +1264,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1230,6 +1280,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1245,6 +1296,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1260,6 +1312,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1275,6 +1328,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1290,6 +1344,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1305,6 +1360,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1320,6 +1376,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
+@@ -1335,6 +1392,7 @@
+ 		.match_phy_device = as21xxx_match_phy_device,
+ 		.read_status	= as21xxx_read_status,
+ 		.get_features	= as21xxx_get_features,
++		.config_init	= as21xxx_config_init,
+ 		.read_mmd	= as21xxx_read_mmd,
+ 		.led_brightness_set = as21xxx_led_brightness_set,
+ 		.led_hw_is_supported = as21xxx_led_hw_is_supported,
