@@ -1,0 +1,60 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: trust DT-declared exact model during match
+
+The BPI-R4 Pro 8X declares the two AS21010PB1 PHYs with both the generic
+C45 compatible and the exact fixed PHY ID:
+
+  compatible = "ethernet-phy-id7500.9432",
+               "ethernet-phy-ieee802.3-c45";
+
+That fixed compatible is an explicit board-level model assertion.  Do
+not still require AS21xxx match-time MMD ID reads or the generic
+firmware pre-pass to discover the same model.  On r0+37890-a627bc320b
+the WAN-side PHY28 eventually bound after probe-time firmware load, but
+the LAN-side PHY24 still stayed on the generic C45 device and left MxL
+port 13 with an empty speed mask:
+
+  mdio-bus:18 phy_id 0x00000000 no DRIVER
+  mxl862xx ... combo-lan ... support ...00006000 ... failed: -EINVAL
+
+When DT supplies an exact AS21xxx model, skip the generic AS21xxx entry
+and bind only the matching concrete AS21xxx driver entry.  Probe then
+loads firmware before IPC sync, as restored by the previous patch.
+
+This keeps non-DT and non-exact-ID users on the existing hardware-ID
+discovery path while making the BPI-R4 Pro 8X fixed-ID declaration
+deterministic.
+
+Behavior source: local r0+37890-a627bc320b serial runtime evidence and
+the vendor AS21xxx probe ordering.
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -1008,6 +1008,22 @@ static int as21xxx_match_phy_device(stru
+ 
+ 	dt_phy_id = as21xxx_dt_phy_id(phydev);
+ 
++	if (dt_phy_id) {
++		/*
++		 * The fixed ethernet-phy-id compatible is already an exact
++		 * model assertion.  Avoid the generic firmware pre-pass and
++		 * unreliable match-time ID reads; probe will load firmware
++		 * for firmware-described DT nodes.
++		 */
++		if (phydrv->phy_id == PHY_ID_AS21XXX)
++			return 0;
++
++		if (phydrv->phy_id == dt_phy_id) {
++			phydev->phy_id = dt_phy_id;
++			return 1;
++		}
++	}
++
+ 	/* Skip PHY that are not AS21xxx */
+ 	if (!phy_id_compare_vendor(phydev->c45_ids.device_ids[MDIO_MMD_PCS],
+ 				   PHY_VENDOR_AEONSEMI) && !dt_phy_id)
