@@ -1,0 +1,156 @@
+From: OpenAI ChatGPT/Codex (GPT-5) <codex@openai.com>
+Subject: [PATCH] net: phy: as21xxx: retry DT firmware load while loader is busy
+
+Runtime on r0+37891-df02e121d7 moved the BPI-R4 Pro 8X LAN-side
+AS21010PB1 from "not selected" to "selected too early":
+
+  Aeonsemi AS21010PB1 mdio-bus:18: wrong origin mdio_indirect_status: c000
+  Aeonsemi AS21010PB1 mdio-bus:18: probe ... failed with error -22
+
+After boot had settled, manually unbinding Generic Clause 45 PHY and
+binding the same mdio-bus:18 device to Aeonsemi AS21010PB1 succeeded and
+logged Firmware Version: 1.9.1.  That proves the PHY, firmware blob, and
+DT model are usable; the automatic probe path simply treats an early
+firmware-loader busy state as a permanent failure.
+
+The vendor AS21xxx driver does not ignore wrong-origin loader status.  It
+also does not retry this exact path, but it does contain several
+readiness waits after firmware load and during config_init.  Keep the
+upstream driver's hard-failure semantics for normal callers, but let
+firmware-described DT nodes retry the loader for a bounded time before
+falling back to the same error.
+
+Also match the vendor IPC wait budget more closely by allowing IPC
+command completion polling to run for up to two seconds.  This only
+affects slow/error paths; successful commands return as soon as the
+firmware reports readiness.
+
+Behavior source: Banana Pi BPI-R4 Pro 8X vendor as21xxx.c readiness
+handling and local r0+37891-df02e121d7 serial runtime/manual rebind
+evidence.
+
+Adapted-by: OpenAI ChatGPT/Codex (GPT-5)
+---
+ drivers/net/phy/as21xxx.c | 59 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 57 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/phy/as21xxx.c
++++ b/drivers/net/phy/as21xxx.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -191,7 +192,10 @@
+ 
+ #define AEON_MAX_LEDS			5
+ #define AEON_IPC_DELAY			10000
+-#define AEON_IPC_TIMEOUT		(AEON_IPC_DELAY * 100)
++#define AEON_IPC_TIMEOUT		(AEON_IPC_DELAY * 200)
++
++#define AEON_FW_LOAD_RETRY_DELAY_MS	500
++#define AEON_FW_LOAD_RETRY_TIMEOUT_MS	15000
+ #define AEON_IPC_DATA_NUM_REGISTERS	8
+ #define AEON_IPC_DATA_MAX		(AEON_IPC_DATA_NUM_REGISTERS * sizeof(u16))
+ 
+@@ -345,8 +349,7 @@
+ static int aeon_firmware_boot(struct phy_device *phydev, const u8 *data,
+ 			      size_t size)
+ {
+-	int i, ret;
+-	u16 val;
++	int i, ret, val;
+ 
+ 	ret = phy_modify_mmd(phydev, MDIO_MMD_VEND1, VEND1_GLB_REG_CPU_CTRL,
+ 			     VEND1_GLB_CPU_CTRL_MASK, AEON_CPU_CTRL_FW_LOAD);
+@@ -366,9 +369,11 @@
+ 
+ 	val = phy_read_mmd(phydev, MDIO_MMD_VEND1,
+ 			   VEND1_GLB_REG_MDIO_INDIRECT_STATUS);
++	if (val < 0)
++		return val;
+ 	if (val > 1) {
+-		phydev_err(phydev, "wrong origin mdio_indirect_status: %x\n", val);
+-		return -EINVAL;
++		phydev_dbg(phydev, "firmware loader busy, mdio_indirect_status: %x\n", val);
++		return -EBUSY;
+ 	}
+ 
+ 	/* Firmware is always aligned to u16 */
+@@ -397,7 +402,7 @@
+ 			      VEND1_GLB_CPU_CTRL_MASK, AEON_CPU_CTRL_FW_START);
+ }
+ 
+-static int aeon_firmware_load(struct phy_device *phydev)
++static int aeon_firmware_load_once(struct phy_device *phydev)
+ {
+ 	struct device *dev = &phydev->mdio.dev;
+ 	const struct firmware *fw;
+@@ -423,6 +428,55 @@
+ 	return ret;
+ }
+ 
++static int aeon_firmware_load(struct phy_device *phydev)
++{
++	int ret;
++
++	ret = aeon_firmware_load_once(phydev);
++	if (ret == -EBUSY) {
++		phydev_err(phydev, "firmware loader not ready\n");
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++static int aeon_firmware_load_wait(struct phy_device *phydev)
++{
++	unsigned int elapsed_ms = 0;
++	int ret;
++
++	ret = aeon_firmware_load_once(phydev);
++	if (ret != -EBUSY)
++		return ret;
++
++	phydev_warn(phydev, "firmware loader busy, retrying for up to %u ms\n",
++		    AEON_FW_LOAD_RETRY_TIMEOUT_MS);
++
++	while (elapsed_ms < AEON_FW_LOAD_RETRY_TIMEOUT_MS) {
++		msleep(AEON_FW_LOAD_RETRY_DELAY_MS);
++		elapsed_ms += AEON_FW_LOAD_RETRY_DELAY_MS;
++
++		ret = aeon_firmware_load_once(phydev);
++		if (ret != -EBUSY)
++			break;
++	}
++
++	if (ret == -EBUSY) {
++		phydev_err(phydev, "firmware loader stayed busy after %u ms\n",
++			   elapsed_ms);
++		return -EINVAL;
++	}
++
++	if (ret)
++		return ret;
++
++	phydev_info(phydev, "firmware loader ready after %u ms\n",
++		    elapsed_ms);
++
++	return 0;
++}
++
+ static bool aeon_ipc_ready(u16 val, bool parity_status)
+ {
+ 	u16 status;
+@@ -674,7 +728,7 @@
+ 	if (phydev->mdio.dev.of_node &&
+ 	    of_find_property(phydev->mdio.dev.of_node,
+ 			     "firmware-name", NULL)) {
+-		ret = aeon_firmware_load(phydev);
++		ret = aeon_firmware_load_wait(phydev);
+ 		if (ret)
+ 			return ret;
+ 	}
