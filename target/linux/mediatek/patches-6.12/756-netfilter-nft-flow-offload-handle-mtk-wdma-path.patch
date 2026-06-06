@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 6 Jun 2026 00:00:00 +0000
+Subject: [PATCH] netfilter: nft_flow_offload: handle MediaTek WDMA paths
+
+The BPI-R4 Pro 8X vendor tree carries a MediaTek patch that teaches
+nft_flow_offload to keep the correct source MAC when the forwarding path
+contains DEV_PATH_MTK_WDMA. Without it, RelayD/Wi-Fi WDMA paths can populate
+an incorrect source MAC and stall fastpath/hardware-path traffic.
+
+Vendor source:
+refs/vendor/bpi-r4pro-8x-openwrt24.10/target/linux/mediatek/patches-6.6/
+999-3015-netfilter-add-DEV_PATH_MTK_WDMA-path-to-nft_flow_offload.patch
+
+Adapted for ImmortalWrt 25.12 / Linux 6.12 by OpenAI ChatGPT/Codex (GPT-5).
+
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Signed-off-by: Codex <codex@local>
+---
+ net/netfilter/nft_flow_offload.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -160,6 +160,10 @@ static void nft_dev_path_info(const stru
+ 			}
+ 			info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ 			break;
++		case DEV_PATH_MTK_WDMA:
++			if (is_zero_ether_addr(info->h_source))
++				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
++			break;
+ 		default:
+ 			info->indev = NULL;
+ 			break;

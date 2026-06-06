@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 6 Jun 2026 00:00:00 +0000
+Subject: [PATCH] net: ethernet: mtk_ppe: apply vendor NETSYSv3 PPE fixes
+
+The official BPI-R4 Pro 8X vendor tree carries several MT7988/NETSYSv3 PPE
+fixes that are directly relevant to the 8X hardware acceleration path:
+
+- keep PPE source-port bits after a flow becomes BIND
+- enable CS0_PIPE and SRH_CACHE_FIRST for NETSYSv3 small-packet throughput
+- fix the MIB cache enable mask
+- keep TCP/UDP PPE aging closer to flowtable GC behavior
+- avoid setting the multicast IB2 bit that can confuse CDMA CPU reasons
+
+Vendor sources:
+refs/vendor/bpi-r4pro-8x-openwrt24.10/target/linux/mediatek/patches-6.6/
+999-3002-net-ethernet-mtk_ppe-keep-sp-in-the-info1.patch
+999-3008-net-ethernet-mtk_ppe-enable-CS0_PIPE-and-SRH_CACHE_F.patch
+999-3009-net-ethernet-mtk_ppe-fix-typo-for-enabling-MIB-cache.patch
+999-3011-net-ethernet-mtk_ppe-change-TCP-UDP-aging-out-time.patch
+999-3012-net-ethernet-mtk_ppe-delete-ib2-mcast-bit-from-ppe-e.patch
+
+Adapted for ImmortalWrt 25.12 / Linux 6.12 by OpenAI ChatGPT/Codex (GPT-5).
+
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Signed-off-by: Codex <codex@local>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h     | 16 ++++++++++++++++
+ drivers/net/ethernet/mediatek/mtk_ppe.c         | 38 +++++++++++++++++++++++++++---------
+ drivers/net/ethernet/mediatek/mtk_ppe.h         |  2 ++
+ drivers/net/ethernet/mediatek/mtk_ppe_offload.c |  2 ++
+ drivers/net/ethernet/mediatek/mtk_ppe_regs.h    |  2 ++
+ 5 files changed, 51 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1560,6 +1560,22 @@ static inline u32 mtk_get_ib1_pkt_type(s
+ 	return FIELD_GET(MTK_FOE_IB1_PACKET_TYPE, val);
+ }
+ 
++static inline u32 mtk_prep_ib1_sp(struct mtk_eth *eth, u32 val)
++{
++	if (mtk_is_netsys_v2_or_greater(eth))
++		return FIELD_PREP(MTK_FOE_IB1_BIND_SRC_PORT_V2, val);
++
++	return 0;
++}
++
++static inline u32 mtk_get_ib1_sp(struct mtk_eth *eth, struct mtk_foe_entry *foe)
++{
++	if (mtk_is_netsys_v2_or_greater(eth))
++		return FIELD_GET(MTK_FOE_IB1_BIND_SRC_PORT_V2, foe->ib1);
++
++	return 0;
++}
++
+ static inline u32 mtk_get_ib2_multicast_mask(struct mtk_eth *eth)
+ {
+ 	if (mtk_is_netsys_v2_or_greater(eth))
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -247,9 +247,6 @@ int mtk_foe_entry_prepare(struct mtk_eth
+ 		      FIELD_PREP(MTK_FOE_IB2_PORT_AG, 0x1f);
+ 	}
+ 
+-	if (is_multicast_ether_addr(dest_mac))
+-		val |= mtk_get_ib2_multicast_mask(eth);
+-
+ 	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
+ 	if (type == MTK_PPE_PKT_TYPE_IPV4_ROUTE)
+ 		entry->ipv4.orig.ports = ports_pad;
+@@ -515,6 +512,31 @@ mtk_flow_entry_match(struct mtk_eth *eth
+ 	return !memcmp(&entry->data.data, &data->data, len - 4);
+ }
+ 
++int mtk_foe_entry_set_sp(struct mtk_ppe *ppe, struct mtk_foe_entry *foe)
++{
++	struct mtk_eth *eth = ppe->eth;
++	struct mtk_flow_entry entry;
++	struct mtk_foe_entry *hwe;
++	u32 hash, sp = 0;
++	int len, i;
++
++	memcpy(&entry.data, foe, sizeof(entry.data));
++
++	len = mtk_flow_entry_match_len(eth, &entry.data);
++	hash = mtk_ppe_hash_entry(eth, &entry.data);
++	for (i = 0; i < eth->soc->hash_offset; i++) {
++		hwe = mtk_foe_get_entry(ppe, hash + i);
++		if (mtk_flow_entry_match(eth, &entry, hwe, len)) {
++			sp = mtk_get_ib1_sp(ppe->eth, hwe);
++			break;
++		}
++	}
++
++	foe->ib1 |= mtk_prep_ib1_sp(ppe->eth, sp);
++
++	return 0;
++}
++
+ static void
+ __mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 		      bool set_state)
+@@ -1074,12 +1096,12 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 	      FIELD_PREP(MTK_PPE_UNBIND_AGE_DELTA, 3);
+ 	ppe_w32(ppe, MTK_PPE_UNBIND_AGE, val);
+ 
+-	val = FIELD_PREP(MTK_PPE_BIND_AGE0_DELTA_UDP, 12) |
++	val = FIELD_PREP(MTK_PPE_BIND_AGE0_DELTA_UDP, 30) |
+ 	      FIELD_PREP(MTK_PPE_BIND_AGE0_DELTA_NON_L4, 1);
+ 	ppe_w32(ppe, MTK_PPE_BIND_AGE0, val);
+ 
+ 	val = FIELD_PREP(MTK_PPE_BIND_AGE1_DELTA_TCP_FIN, 1) |
+-	      FIELD_PREP(MTK_PPE_BIND_AGE1_DELTA_TCP, 7);
++	      FIELD_PREP(MTK_PPE_BIND_AGE1_DELTA_TCP, 30);
+ 	ppe_w32(ppe, MTK_PPE_BIND_AGE1, val);
+ 
+ 	val = MTK_PPE_BIND_LIMIT0_QUARTER | MTK_PPE_BIND_LIMIT0_HALF;
+@@ -1094,6 +1116,10 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 	      MTK_PPE_GLO_CFG_IP4_L4_CS_DROP |
+ 	      MTK_PPE_GLO_CFG_IP4_CS_DROP |
+ 	      MTK_PPE_GLO_CFG_FLOW_DROP_UPDATE;
++	if (mtk_is_netsys_v3_or_greater(ppe->eth))
++		val |= MTK_PPE_GLO_CFG_CS0_PIPE_EN |
++		       MTK_PPE_GLO_CFG_SRH_CACHE_FIRST_EN;
++
+ 	ppe_w32(ppe, MTK_PPE_GLO_CFG, val);
+ 
+ 	ppe_w32(ppe, MTK_PPE_DEFAULT_CPU_PORT, 0);
+@@ -1112,7 +1138,7 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 		ppe_m32(ppe, MTK_PPE_MIB_CFG, MTK_PPE_MIB_CFG_RD_CLR,
+ 			MTK_PPE_MIB_CFG_RD_CLR);
+ 		ppe_m32(ppe, MTK_PPE_MIB_CACHE_CTL, MTK_PPE_MIB_CACHE_CTL_EN,
+-			MTK_PPE_MIB_CFG_RD_CLR);
++			MTK_PPE_MIB_CACHE_CTL_EN);
+ 	}
+ }
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -34,6 +34,7 @@
+ 
+ /* CONFIG_MEDIATEK_NETSYS_V2 */
+ #define MTK_FOE_IB1_BIND_TIMESTAMP_V2	GENMASK(7, 0)
++#define MTK_FOE_IB1_BIND_SRC_PORT_V2	GENMASK(11, 8)
+ #define MTK_FOE_IB1_BIND_VLAN_LAYER_V2	GENMASK(16, 14)
+ #define MTK_FOE_IB1_BIND_PPPOE_V2	BIT(17)
+ #define MTK_FOE_IB1_BIND_VLAN_TAG_V2	BIT(18)
+@@ -400,6 +401,7 @@ int mtk_foe_entry_set_wdma(struct mtk_et
+ 			   int wdma_idx, int txq, int bss, int wcid,
+ 			   bool amsdu_en);
+ int mtk_foe_entry_set_queue(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+ 			    unsigned int queue);
++int mtk_foe_entry_set_sp(struct mtk_ppe *ppe, struct mtk_foe_entry *entry);
+ int mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index);
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -459,6 +459,8 @@ mtk_flow_offload_replace(struct mtk_eth
+ 	if (data.pppoe.num == 1)
+ 		mtk_foe_entry_set_pppoe(eth, &foe, data.pppoe.sid);
+ 
++	mtk_foe_entry_set_sp(eth->ppe[ppe_index], &foe);
++
+ 	err = mtk_flow_set_output_device(eth, &foe, odev, data.eth.h_dest,
+ 					 &wed_index);
+ 	if (err)
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_regs.h
+@@ -18,6 +18,8 @@
+ #define MTK_PPE_GLO_CFG_UDP_LITE_EN		BIT(10)
+ #define MTK_PPE_GLO_CFG_UDP_LEN_DROP		BIT(11)
+ #define MTK_PPE_GLO_CFG_MCAST_ENTRIES		GNEMASK(13, 12)
++#define MTK_PPE_GLO_CFG_CS0_PIPE_EN		BIT(29)
++#define MTK_PPE_GLO_CFG_SRH_CACHE_FIRST_EN	BIT(30)
+ #define MTK_PPE_GLO_CFG_BUSY			BIT(31)
+ 
+ #define MTK_PPE_FLOW_CFG			0x204

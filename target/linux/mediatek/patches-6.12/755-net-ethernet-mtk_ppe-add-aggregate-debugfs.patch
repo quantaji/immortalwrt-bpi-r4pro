@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sat, 6 Jun 2026 00:00:00 +0000
+Subject: [PATCH] net: ethernet: mtk_ppe: add aggregate debugfs entries
+
+The BPI-R4 Pro 8X vendor image exposes both per-PPE debugfs directories
+and an aggregate /sys/kernel/debug/mtk_ppe directory. Keep the existing
+upstream ppe0/ppe1/ppe2 directories and add the aggregate entries as a
+small vendor-parity diagnostic surface.
+
+This intentionally does not import the vendor HNAT driver or QoS/PPPQ
+flow-offload changes. The aggregate entries only make it easier to inspect
+all PPE tables through one path.
+
+Signed-off-by: Codex <codex@local>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c |  2 +
+ drivers/net/ethernet/mediatek/mtk_ppe.c     |  1 +
+ drivers/net/ethernet/mediatek/mtk_ppe.h     |  2 +
+ drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c | 60 +++++++++++++++++++
+ 4 files changed, 65 insertions(+)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5677,6 +5677,8 @@ static int mtk_probe(struct platform_dev
+ 			if (err)
+ 				goto err_deinit_ppe;
+ 		}
++
++		mtk_ppe_internal_debugfs_init(eth);
+ 	}
+ 
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -904,6 +904,7 @@ struct mtk_ppe *mtk_ppe_init(struct mtk_
+ 	 * not coherent.
+ 	 */
+ 	ppe->base = base;
++	ppe->index = index;
+ 	ppe->eth = eth;
+ 	ppe->dev = dev;
+ 	ppe->version = eth->soc->offload_version;
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -328,6 +328,7 @@ struct mtk_ppe {
+ 	struct mtk_eth *eth;
+ 	struct device *dev;
+ 	void __iomem *base;
++	int index;
+ 	int version;
+ 	char dirname[5];
+ 	bool accounting;
+@@ -402,6 +403,7 @@ int mtk_foe_entry_set_queue(struct mtk_e
+ int mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index);
++int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth);
+ void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			     int *idle);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+@@ -125,6 +125,8 @@ mtk_ppe_debugfs_foe_show(struct seq_file
+ 			break;
+ 		}
+ 
++		seq_printf(m, " ppe=%d", ppe->index);
++
+ 		seq_printf(m, " orig=");
+ 		mtk_print_addr_info(m, &ai);
+ 
+@@ -195,3 +197,61 @@ int mtk_ppe_debugfs_init(struct mtk_ppe
+ 
+ 	return 0;
+ }
++
++static int
++mtk_ppe_internal_debugfs_foe_all_show(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++	void *backup;
++	int i;
++
++	backup = m->private;
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		m->private = eth->ppe[i];
++		mtk_ppe_debugfs_foe_show(m, private, false);
++	}
++	m->private = backup;
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_foe_all);
++
++static int
++mtk_ppe_internal_debugfs_foe_bind_show(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++	void *backup;
++	int i;
++
++	backup = m->private;
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		m->private = eth->ppe[i];
++		mtk_ppe_debugfs_foe_show(m, private, true);
++	}
++	m->private = backup;
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_foe_bind);
++
++int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth)
++{
++	struct dentry *root;
++
++	root = debugfs_create_dir("mtk_ppe", NULL);
++	if (IS_ERR_OR_NULL(root))
++		return root ? PTR_ERR(root) : -ENOMEM;
++
++	debugfs_create_file("entries", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_foe_all_fops);
++	debugfs_create_file("bind", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_foe_bind_fops);
++
++	return 0;
++}
