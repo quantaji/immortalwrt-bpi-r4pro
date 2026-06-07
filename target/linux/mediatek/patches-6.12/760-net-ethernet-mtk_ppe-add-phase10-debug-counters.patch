@@ -1,0 +1,400 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 7 Jun 2026 00:00:00 -0700
+Subject: [PATCH] net: ethernet: mtk_ppe: add phase10 debug counters
+
+Add lightweight debugfs counters around the MediaTek PPE flow offload
+bind path.  The counters are intentionally diagnostic-only: they do not
+change flow programming behavior, but make it possible to distinguish
+between flowtable replace success, pending flow insertion, UNB skb check
+events, pending-match misses, and final hardware BND writes.
+
+Signed-off-by: Codex <codex@local>
+---
+ drivers/net/ethernet/mediatek/mtk_ppe.c         |  64 +++++++-
+ drivers/net/ethernet/mediatek/mtk_ppe.h         |  37 +++++
+ drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c | 170 +++++++++++++++++++++++
+ 3 files changed, 258 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_ppe.c b/drivers/net/ethernet/mediatek/mtk_ppe.c
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -543,6 +543,11 @@ __mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ {
+ 	struct hlist_node *tmp;
+ 
++	if (entry->hash == 0xffff)
++		mtk_ppe_diag_inc(ppe, clear_unbound);
++	else
++		mtk_ppe_diag_inc(ppe, clear_bound);
++
+ 	if (entry->type == MTK_FLOW_TYPE_L2) {
+ 		rhashtable_remove_fast(&ppe->l2_flows, &entry->l2_node,
+ 				       mtk_flow_l2_ht_params);
+@@ -682,6 +687,8 @@ __mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_foe_entry *entry,
+ 	struct mtk_foe_entry *hwe;
+ 	u32 val;
+ 
++	mtk_ppe_diag_inc(ppe, commit_hw);
++
+ 	if (mtk_is_netsys_v2_or_greater(eth)) {
+ 		entry->ib1 &= ~MTK_FOE_IB1_BIND_TIMESTAMP_V2;
+ 		entry->ib1 |= FIELD_PREP(MTK_FOE_IB1_BIND_TIMESTAMP_V2,
+@@ -730,6 +737,7 @@ mtk_foe_entry_commit_l2(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
+ 	struct mtk_flow_entry *prev;
+ 
+ 	entry->type = MTK_FLOW_TYPE_L2;
++	mtk_ppe_diag_inc(ppe, commit_l2);
+ 
+ 	prev = rhashtable_lookup_get_insert_fast(&ppe->l2_flows, &entry->l2_node,
+ 						 mtk_flow_l2_ht_params);
+@@ -758,6 +766,7 @@ int mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
+ 	spin_lock_bh(&ppe_lock);
+ 	hlist_add_head(&entry->list, &ppe->foe_flow[hash / soc->hash_offset]);
+ 	spin_unlock_bh(&ppe_lock);
++	mtk_ppe_diag_inc(ppe, commit_pending);
+ 
+ 	return 0;
+ }
+@@ -799,6 +808,7 @@ mtk_foe_entry_commit_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 
+ 	*mtk_foe_entry_ib2(ppe->eth, &flow_info->data) = entry->data.bridge.ib2;
+ 
++	mtk_ppe_diag_inc(ppe, commit_subflow);
+ 	__mtk_foe_entry_commit(ppe, &flow_info->data, hash);
+ }
+ 
+@@ -812,24 +822,53 @@ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+ 	struct mtk_foe_bridge key = {};
+ 	struct mtk_foe_entry foe = {};
+ 	struct hlist_node *n;
++	int scanned = 0;
+ 	struct ethhdr *eh;
+ 	bool found = false;
+ 	int entry_len;
++	int state;
+ 	u8 *tag;
+ 
+ 	spin_lock_bh(&ppe_lock);
+ 
+-	if (FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1) == MTK_FOE_STATE_BIND)
++	mtk_ppe_diag_inc(ppe, check_enter);
++
++	state = FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1);
++	switch (state) {
++	case MTK_FOE_STATE_INVALID:
++		mtk_ppe_diag_inc(ppe, check_state_invalid);
++		break;
++	case MTK_FOE_STATE_UNBIND:
++		mtk_ppe_diag_inc(ppe, check_state_unbind);
++		break;
++	case MTK_FOE_STATE_BIND:
++		mtk_ppe_diag_inc(ppe, check_state_bind);
++		break;
++	case MTK_FOE_STATE_FIN:
++		mtk_ppe_diag_inc(ppe, check_state_fin);
++		break;
++	default:
++		mtk_ppe_diag_inc(ppe, check_state_other);
++		break;
++	}
++
++	if (state == MTK_FOE_STATE_BIND)
+ 		goto out;
+ 
+ 	entry_len = mtk_flow_entry_match_len(ppe->eth, hwe);
+ 	memcpy(&foe, hwe, entry_len);
+ 
+ 	hlist_for_each_entry_safe(entry, n, head, list) {
++		scanned++;
+ 		if (found ||
+ 		    !mtk_flow_entry_match(ppe->eth, entry, &foe, entry_len)) {
+-			if (entry->hash != 0xffff)
++			if (entry->hash != 0xffff) {
++				mtk_ppe_diag_inc(ppe, check_pending_clear_bound);
+ 				__mtk_foe_entry_clear(ppe, entry, false);
++			} else {
++				mtk_ppe_diag_inc(ppe,
++						 check_pending_mismatch_unbound);
++			}
+ 			continue;
+ 		}
+ 
+@@ -836,9 +875,17 @@ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+ 		__mtk_foe_entry_commit(ppe, &entry->data, hash);
+ 		found = true;
+ 	}
++	mtk_ppe_diag_add(ppe, check_pending_scanned, scanned);
+ 
+-	if (found)
++	if (found) {
++		mtk_ppe_diag_inc(ppe, check_pending_match);
+ 		goto out;
++	}
++
++	if (scanned)
++		mtk_ppe_diag_inc(ppe, check_pending_miss);
++	else
++		mtk_ppe_diag_inc(ppe, check_pending_empty);
+ 
+ 	eh = eth_hdr(skb);
+ 	ether_addr_copy(key.dest_mac, eh->h_dest);
+@@ -869,8 +916,11 @@ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+ 	}
+ 
+ 	entry = rhashtable_lookup_fast(&ppe->l2_flows, &key, mtk_flow_l2_ht_params);
+-	if (!entry)
++	if (!entry) {
++		mtk_ppe_diag_inc(ppe, check_l2_lookup_miss);
+ 		goto out;
++	}
++	mtk_ppe_diag_inc(ppe, check_l2_lookup_hit);
+ 
+ 	mtk_foe_entry_commit_subflow(ppe, entry, hash);
+ 
+diff --git a/drivers/net/ethernet/mediatek/mtk_ppe.h b/drivers/net/ethernet/mediatek/mtk_ppe.h
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -323,6 +323,33 @@ struct mtk_foe_accounting {
+ 	u64	packets;
+ };
+ 
++struct mtk_ppe_phase10_diag {
++	u64 commit_pending;
++	u64 commit_l2;
++	u64 commit_hw;
++	u64 commit_subflow;
++	u64 clear_bound;
++	u64 clear_unbound;
++	u64 check_seen;
++	u64 check_bad_hash;
++	u64 check_throttled;
++	u64 check_passed;
++	u64 check_enter;
++	u64 check_state_invalid;
++	u64 check_state_unbind;
++	u64 check_state_bind;
++	u64 check_state_fin;
++	u64 check_state_other;
++	u64 check_pending_scanned;
++	u64 check_pending_match;
++	u64 check_pending_miss;
++	u64 check_pending_empty;
++	u64 check_pending_mismatch_unbound;
++	u64 check_pending_clear_bound;
++	u64 check_l2_lookup_hit;
++	u64 check_l2_lookup_miss;
++};
++
+ struct mtk_ppe {
+ 	struct mtk_eth *eth;
+ 	struct device *dev;
+@@ -344,8 +371,21 @@ struct mtk_ppe {
+ 	struct rhashtable l2_flows;
+ 
+ 	void *acct_table;
++
++	struct mtk_ppe_phase10_diag phase10_diag;
+ };
+ 
++#define mtk_ppe_diag_inc(_ppe, _field) do {			\
++	struct mtk_ppe *__ppe = (_ppe);				\
++	if (__ppe)						\
++		__ppe->phase10_diag._field++;			\
++} while (0)
++#define mtk_ppe_diag_add(_ppe, _field, _val) do {		\
++	struct mtk_ppe *__ppe = (_ppe);				\
++	if (__ppe)						\
++		__ppe->phase10_diag._field += (_val);		\
++} while (0)
++
+ struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index);
+ 
+ void mtk_ppe_deinit(struct mtk_eth *eth);
+@@ -363,15 +403,21 @@ mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+ 	if (!ppe)
+ 		return;
+ 
+-	if (hash > MTK_PPE_HASH_MASK)
++	mtk_ppe_diag_inc(ppe, check_seen);
++	if (hash > MTK_PPE_HASH_MASK) {
++		mtk_ppe_diag_inc(ppe, check_bad_hash);
+ 		return;
++	}
+ 
+ 	now = (u16)jiffies;
+ 	diff = now - ppe->foe_check_time[hash];
+-	if (diff < HZ / 10)
+-		return;
++	if (diff < HZ / 10) {
++		mtk_ppe_diag_inc(ppe, check_throttled);
++		return;
++	}
+ 
+ 	ppe->foe_check_time[hash] = now;
++	mtk_ppe_diag_inc(ppe, check_passed);
+ 	__mtk_ppe_check_skb(ppe, skb, hash);
+ }
+ 
+diff --git a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+@@ -183,6 +183,81 @@ mtk_ppe_debugfs_foe_bind_show(struct seq_file *m, void *private)
+ }
+ DEFINE_SHOW_ATTRIBUTE(mtk_ppe_debugfs_foe_bind);
+ 
++static void
++mtk_ppe_debugfs_diag_reset_ppe(struct mtk_ppe *ppe)
++{
++	memset(&ppe->phase10_diag, 0, sizeof(ppe->phase10_diag));
++}
++
++static void
++mtk_ppe_debugfs_diag_print(struct seq_file *m, struct mtk_ppe *ppe)
++{
++	struct mtk_ppe_phase10_diag *d = &ppe->phase10_diag;
++
++	seq_printf(m, "ppe%d\n", ppe->index);
++#define MTK_PPE_PHASE10_DIAG_FIELD(_field) \
++	seq_printf(m, "  %-32s %llu\n", #_field, d->_field)
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_pending);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_l2);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_hw);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_subflow);
++	MTK_PPE_PHASE10_DIAG_FIELD(clear_bound);
++	MTK_PPE_PHASE10_DIAG_FIELD(clear_unbound);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_seen);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_bad_hash);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_throttled);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_passed);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_enter);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_state_invalid);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_state_unbind);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_state_bind);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_state_fin);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_state_other);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_scanned);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_match);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_miss);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_empty);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_mismatch_unbound);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_clear_bound);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_l2_lookup_hit);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_l2_lookup_miss);
++#undef MTK_PPE_PHASE10_DIAG_FIELD
++}
++
++static int
++mtk_ppe_debugfs_diag_show(struct seq_file *m, void *private)
++{
++	mtk_ppe_debugfs_diag_print(m, m->private);
++
++	return 0;
++}
++
++static int
++mtk_ppe_debugfs_diag_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mtk_ppe_debugfs_diag_show, inode->i_private);
++}
++
++static ssize_t
++mtk_ppe_debugfs_diag_write(struct file *file, const char __user *user_buf,
++			   size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct mtk_ppe *ppe = m->private;
++
++	mtk_ppe_debugfs_diag_reset_ppe(ppe);
++
++	return count;
++}
++
++static const struct file_operations mtk_ppe_debugfs_diag_fops = {
++	.open = mtk_ppe_debugfs_diag_open,
++	.read = seq_read,
++	.write = mtk_ppe_debugfs_diag_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index)
+ {
+ 	struct dentry *root;
+@@ -192,6 +267,8 @@ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index)
+ 	root = debugfs_create_dir(ppe->dirname, NULL);
+ 	debugfs_create_file("entries", S_IRUGO, root, ppe, &mtk_ppe_debugfs_foe_all_fops);
+ 	debugfs_create_file("bind", S_IRUGO, root, ppe, &mtk_ppe_debugfs_foe_bind_fops);
++	debugfs_create_file("phase10_diag", S_IRUGO | S_IWUSR, root, ppe,
++			    &mtk_ppe_debugfs_diag_fops);
+ 
+ 	return 0;
+ }
+@@ -238,6 +315,56 @@ mtk_ppe_internal_debugfs_foe_bind_show(struct seq_file *m, void *private)
+ }
+ DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_foe_bind);
+ 
++static int
++mtk_ppe_internal_debugfs_diag_show(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		mtk_ppe_debugfs_diag_print(m, eth->ppe[i]);
++	}
++
++	return 0;
++}
++
++static int
++mtk_ppe_internal_debugfs_diag_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, mtk_ppe_internal_debugfs_diag_show,
++			   inode->i_private);
++}
++
++static ssize_t
++mtk_ppe_internal_debugfs_diag_write(struct file *file,
++				    const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct seq_file *m = file->private_data;
++	struct mtk_eth *eth = m->private;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		mtk_ppe_debugfs_diag_reset_ppe(eth->ppe[i]);
++	}
++
++	return count;
++}
++
++static const struct file_operations mtk_ppe_internal_debugfs_diag_fops = {
++	.open = mtk_ppe_internal_debugfs_diag_open,
++	.read = seq_read,
++	.write = mtk_ppe_internal_debugfs_diag_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth)
+ {
+ 	struct dentry *root;
+@@ -250,6 +377,8 @@ int mtk_ppe_internal_debugfs_init(struct mtk_eth *eth)
+ 				    &mtk_ppe_internal_debugfs_foe_all_fops);
+ 	debugfs_create_file("bind", S_IRUGO, root, eth,
+ 			    &mtk_ppe_internal_debugfs_foe_bind_fops);
++	debugfs_create_file("phase10_diag", S_IRUGO | S_IWUSR, root, eth,
++			    &mtk_ppe_internal_debugfs_diag_fops);
+ 
+ 	return 0;
+ }
+-- 
+2.43.0
