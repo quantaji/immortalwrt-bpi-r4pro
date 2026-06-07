@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 7 Jun 2026 00:00:00 -0700
+Subject: [PATCH] net: ethernet: mtk_ppe: add phase10 hash bucket probe
+
+Extend the Phase 10 PPE diagnostics with the raw hash and software bucket
+used when a flow is inserted into the pending list, and the raw hash and
+software bucket used when the hardware UNB skb check runs.
+
+Also expose a phase10_pending debugfs view that lists software pending
+flow-list entries by bucket.  This makes it possible to directly compare
+where netfilter/PPE inserted a pending flow with where the hardware hash
+later asks the bind path to look.
+
+Signed-off-by: Codex <codex@local>
+---
+
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -756,14 +756,23 @@ int mtk_foe_entry_commit(struct mtk_ppe
+ 	const struct mtk_soc_data *soc = ppe->eth->soc;
+ 	int type = mtk_get_ib1_pkt_type(ppe->eth, entry->data.ib1);
+ 	u32 hash;
++	u32 bucket;
+ 
+ 	if (type == MTK_PPE_PKT_TYPE_BRIDGE)
+ 		return mtk_foe_entry_commit_l2(ppe, entry);
+ 
+ 	hash = mtk_ppe_hash_entry(ppe->eth, &entry->data);
++	bucket = hash / soc->hash_offset;
++	mtk_ppe_diag_set(ppe, hash_offset, soc->hash_offset);
++	mtk_ppe_diag_set(ppe, commit_pending_last_hash, hash);
++	mtk_ppe_diag_set(ppe, commit_pending_last_bucket, bucket);
++	mtk_ppe_diag_set(ppe, commit_pending_last_type, type);
++	mtk_ppe_diag_set(ppe, commit_pending_last_ib1, entry->data.ib1);
++	mtk_ppe_diag_set(ppe, commit_pending_last_ib2,
++			 *mtk_foe_entry_ib2(ppe->eth, &entry->data));
+ 	entry->hash = 0xffff;
+ 	spin_lock_bh(&ppe_lock);
+-	hlist_add_head(&entry->list, &ppe->foe_flow[hash / soc->hash_offset]);
++	hlist_add_head(&entry->list, &ppe->foe_flow[bucket]);
+ 	spin_unlock_bh(&ppe_lock);
+ 	mtk_ppe_diag_inc(ppe, commit_pending);
+ 
+@@ -815,11 +824,13 @@ mtk_foe_entry_commit_subflow(struct mtk_
+ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
+ {
+ 	const struct mtk_soc_data *soc = ppe->eth->soc;
+-	struct hlist_head *head = &ppe->foe_flow[hash / soc->hash_offset];
++	u32 bucket = hash / soc->hash_offset;
++	struct hlist_head *head = &ppe->foe_flow[bucket];
+ 	struct mtk_foe_entry *hwe = mtk_foe_get_entry(ppe, hash);
+ 	struct mtk_flow_entry *entry;
+ 	struct mtk_foe_bridge key = {};
+ 	struct mtk_foe_entry foe = {};
++	struct mtk_ppe_phase10_diag *diag = &ppe->phase10_diag;
+ 	struct hlist_node *n;
+ 	int scanned = 0;
+ 	struct ethhdr *eh;
+@@ -831,8 +842,33 @@ void __mtk_ppe_check_skb(struct mtk_ppe
+ 	spin_lock_bh(&ppe_lock);
+ 
+ 	mtk_ppe_diag_inc(ppe, check_enter);
++	mtk_ppe_diag_set(ppe, hash_offset, soc->hash_offset);
++	mtk_ppe_diag_set(ppe, check_last_hash, hash);
++	mtk_ppe_diag_set(ppe, check_last_bucket, bucket);
++	mtk_ppe_diag_set(ppe, check_last_ib1, hwe->ib1);
++	mtk_ppe_diag_set(ppe, check_last_ib2,
++			 *mtk_foe_entry_ib2(ppe->eth, hwe));
++
++	if (diag->commit_pending) {
++		if (diag->commit_pending_last_bucket == bucket) {
++			mtk_ppe_diag_inc(ppe, check_bucket_same_as_last_commit);
++			mtk_ppe_diag_set(ppe, check_last_bucket_delta, 0);
++		} else {
++			u64 delta;
++
++			mtk_ppe_diag_inc(ppe, check_bucket_diff_last_commit);
++			if (bucket > diag->commit_pending_last_bucket)
++				delta = bucket - diag->commit_pending_last_bucket;
++			else
++				delta = diag->commit_pending_last_bucket - bucket;
++			mtk_ppe_diag_set(ppe, check_last_bucket_delta, delta);
++		}
++	} else {
++		mtk_ppe_diag_inc(ppe, check_without_commit_pending);
++	}
+ 
+ 	state = FIELD_GET(MTK_FOE_IB1_STATE, hwe->ib1);
++	mtk_ppe_diag_set(ppe, check_last_state, state);
+ 	switch (state) {
+ 	case MTK_FOE_STATE_INVALID:
+ 		mtk_ppe_diag_inc(ppe, check_state_invalid);
+@@ -871,6 +907,9 @@ void __mtk_ppe_check_skb(struct mtk_ppe
+ 			continue;
+ 		}
+ 
++		mtk_ppe_diag_set(ppe, check_match_last_hash, hash);
++		mtk_ppe_diag_set(ppe, check_match_last_bucket, bucket);
++		mtk_ppe_diag_set(ppe, check_match_last_entry_hash, entry->hash);
+ 		entry->hash = hash;
+ 		__mtk_foe_entry_commit(ppe, &entry->data, hash);
+ 		found = true;
+@@ -884,8 +923,12 @@ void __mtk_ppe_check_skb(struct mtk_ppe
+ 
+ 	if (scanned)
+ 		mtk_ppe_diag_inc(ppe, check_pending_miss);
+-	else
++	else {
+ 		mtk_ppe_diag_inc(ppe, check_pending_empty);
++		mtk_ppe_diag_set(ppe, check_empty_last_hash, hash);
++		mtk_ppe_diag_set(ppe, check_empty_last_bucket, bucket);
++		mtk_ppe_diag_set(ppe, check_empty_last_state, state);
++	}
+ 
+ 	eh = eth_hdr(skb);
+ 	ether_addr_copy(key.dest_mac, eh->h_dest);
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -348,6 +348,27 @@ struct mtk_ppe_phase10_diag {
+ 	u64 check_pending_clear_bound;
+ 	u64 check_l2_lookup_hit;
+ 	u64 check_l2_lookup_miss;
++	u64 hash_offset;
++	u64 commit_pending_last_hash;
++	u64 commit_pending_last_bucket;
++	u64 commit_pending_last_type;
++	u64 commit_pending_last_ib1;
++	u64 commit_pending_last_ib2;
++	u64 check_last_hash;
++	u64 check_last_bucket;
++	u64 check_last_state;
++	u64 check_last_ib1;
++	u64 check_last_ib2;
++	u64 check_empty_last_hash;
++	u64 check_empty_last_bucket;
++	u64 check_empty_last_state;
++	u64 check_match_last_hash;
++	u64 check_match_last_bucket;
++	u64 check_match_last_entry_hash;
++	u64 check_bucket_same_as_last_commit;
++	u64 check_bucket_diff_last_commit;
++	u64 check_without_commit_pending;
++	u64 check_last_bucket_delta;
+ };
+ 
+ struct mtk_ppe {
+@@ -385,6 +406,11 @@ struct mtk_ppe {
+ 	if (__ppe)						\
+ 		__ppe->phase10_diag._field += (_val);		\
+ } while (0)
++#define mtk_ppe_diag_set(_ppe, _field, _val) do {		\
++	struct mtk_ppe *__ppe = (_ppe);				\
++	if (__ppe)						\
++		__ppe->phase10_diag._field = (_val);		\
++} while (0)
+ 
+ struct mtk_ppe *mtk_ppe_init(struct mtk_eth *eth, void __iomem *base, int index);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+@@ -183,6 +183,83 @@ mtk_ppe_debugfs_foe_bind_show(struct seq
+ }
+ DEFINE_SHOW_ATTRIBUTE(mtk_ppe_debugfs_foe_bind);
+ 
++static int
++mtk_ppe_debugfs_pending_show(struct seq_file *m, void *private)
++{
++	struct mtk_ppe *ppe = m->private;
++	const struct mtk_soc_data *soc = ppe->eth->soc;
++	struct mtk_flow_entry *entry;
++	int buckets = MTK_PPE_ENTRIES / soc->hash_offset;
++	int i;
++
++	seq_printf(m, "ppe%d hash_offset=%d buckets=%d\n",
++		   ppe->index, soc->hash_offset, buckets);
++
++	for (i = 0; i < buckets; i++) {
++		hlist_for_each_entry(entry, &ppe->foe_flow[i], list) {
++			struct mtk_flow_addr_info ai = {};
++			struct mtk_foe_entry *foe = &entry->data;
++			int type = mtk_get_ib1_pkt_type(ppe->eth, foe->ib1);
++			u32 ib2;
++
++			if (type >= MTK_PPE_PKT_TYPE_IPV4_DSLITE)
++				ib2 = foe->ipv6.ib2;
++			else
++				ib2 = foe->ipv4.ib2;
++
++			seq_printf(m, "%05x ppe=%d entry_hash=%04x"
++				      " flow_type=%d %s ib1=%08x ib2=%08x",
++				   i, ppe->index, entry->hash, entry->type,
++				   mtk_foe_pkt_type_str(type), foe->ib1, ib2);
++
++			switch (type) {
++			case MTK_PPE_PKT_TYPE_IPV4_HNAPT:
++			case MTK_PPE_PKT_TYPE_IPV4_DSLITE:
++				ai.src_port = &foe->ipv4.orig.src_port;
++				ai.dest_port = &foe->ipv4.orig.dest_port;
++				fallthrough;
++			case MTK_PPE_PKT_TYPE_IPV4_ROUTE:
++				ai.src = &foe->ipv4.orig.src_ip;
++				ai.dest = &foe->ipv4.orig.dest_ip;
++				seq_printf(m, " orig=");
++				mtk_print_addr_info(m, &ai);
++				break;
++			case MTK_PPE_PKT_TYPE_IPV6_ROUTE_5T:
++				ai.src_port = &foe->ipv6.src_port;
++				ai.dest_port = &foe->ipv6.dest_port;
++				fallthrough;
++			case MTK_PPE_PKT_TYPE_IPV6_ROUTE_3T:
++			case MTK_PPE_PKT_TYPE_IPV6_6RD:
++				ai.src = &foe->ipv6.src_ip;
++				ai.dest = &foe->ipv6.dest_ip;
++				ai.ipv6 = true;
++				seq_printf(m, " orig=");
++				mtk_print_addr_info(m, &ai);
++				break;
++			}
++
++			switch (type) {
++			case MTK_PPE_PKT_TYPE_IPV4_HNAPT:
++			case MTK_PPE_PKT_TYPE_IPV4_DSLITE:
++				ai.src_port = &foe->ipv4.new.src_port;
++				ai.dest_port = &foe->ipv4.new.dest_port;
++				fallthrough;
++			case MTK_PPE_PKT_TYPE_IPV4_ROUTE:
++				ai.src = &foe->ipv4.new.src_ip;
++				ai.dest = &foe->ipv4.new.dest_ip;
++				seq_printf(m, " new=");
++				mtk_print_addr_info(m, &ai);
++				break;
++			}
++
++			seq_puts(m, "\n");
++		}
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_ppe_debugfs_pending);
++
+ static void
+ mtk_ppe_debugfs_diag_reset_ppe(struct mtk_ppe *ppe)
+ {
+@@ -221,6 +298,27 @@ mtk_ppe_debugfs_diag_print(struct seq_fi
+ 	MTK_PPE_PHASE10_DIAG_FIELD(check_pending_clear_bound);
+ 	MTK_PPE_PHASE10_DIAG_FIELD(check_l2_lookup_hit);
+ 	MTK_PPE_PHASE10_DIAG_FIELD(check_l2_lookup_miss);
++	MTK_PPE_PHASE10_DIAG_FIELD(hash_offset);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_pending_last_hash);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_pending_last_bucket);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_pending_last_type);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_pending_last_ib1);
++	MTK_PPE_PHASE10_DIAG_FIELD(commit_pending_last_ib2);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_last_hash);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_last_bucket);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_last_state);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_last_ib1);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_last_ib2);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_empty_last_hash);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_empty_last_bucket);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_empty_last_state);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_match_last_hash);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_match_last_bucket);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_match_last_entry_hash);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_bucket_same_as_last_commit);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_bucket_diff_last_commit);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_without_commit_pending);
++	MTK_PPE_PHASE10_DIAG_FIELD(check_last_bucket_delta);
+ #undef MTK_PPE_PHASE10_DIAG_FIELD
+ }
+ 
+@@ -269,6 +367,8 @@ int mtk_ppe_debugfs_init(struct mtk_ppe
+ 	debugfs_create_file("bind", S_IRUGO, root, ppe, &mtk_ppe_debugfs_foe_bind_fops);
+ 	debugfs_create_file("phase10_diag", S_IRUGO | S_IWUSR, root, ppe,
+ 			    &mtk_ppe_debugfs_diag_fops);
++	debugfs_create_file("phase10_pending", S_IRUGO, root, ppe,
++			    &mtk_ppe_debugfs_pending_fops);
+ 
+ 	return 0;
+ }
+@@ -316,6 +416,27 @@ mtk_ppe_internal_debugfs_foe_bind_show(s
+ }
+ DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_foe_bind);
+ 
++static int
++mtk_ppe_internal_debugfs_pending_show(struct seq_file *m, void *private)
++{
++	struct mtk_eth *eth = m->private;
++	void *backup;
++	int i;
++
++	backup = m->private;
++	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
++		if (!eth->ppe[i])
++			continue;
++
++		m->private = eth->ppe[i];
++		mtk_ppe_debugfs_pending_show(m, private);
++	}
++	m->private = backup;
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mtk_ppe_internal_debugfs_pending);
++
+ static int
+ mtk_ppe_internal_debugfs_diag_show(struct seq_file *m, void *private)
+ {
+@@ -379,6 +500,8 @@ int mtk_ppe_internal_debugfs_init(struct
+ 			    &mtk_ppe_internal_debugfs_foe_bind_fops);
+ 	debugfs_create_file("phase10_diag", S_IRUGO | S_IWUSR, root, eth,
+ 			    &mtk_ppe_internal_debugfs_diag_fops);
++	debugfs_create_file("phase10_pending", S_IRUGO, root, eth,
++			    &mtk_ppe_internal_debugfs_pending_fops);
+ 
+ 	return 0;
+ }
+-- 
+2.43.0
