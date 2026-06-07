@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Sun, 7 Jun 2026 00:00:00 -0700
+Subject: [PATCH] net: ethernet: mtk_ppe: support mxl862xx DSA offload tags
+
+BPI-R4 Pro 8X routes some LAN ports through the MxL862xx DSA switch.
+Those ports use the DSA 802.1Q tagger instead of the MediaTek DSA tagger.
+
+The PPE offload code only accepted DSA_TAG_PROTO_MTK, so flowtable entries
+targeting MxL862xx user ports were programmed without the DSA tag needed to
+reach the physical output port. Accept the MxL862xx 802.1Q tagger and encode
+the standalone DSA 802.1Q VID in the FOE entry, matching the vendor 8X
+offload path.
+
+Signed-off-by: Codex <codex@local>
+---
+ drivers/net/ethernet/mediatek/mtk_ppe.c         | 7 ++++++-
+ drivers/net/ethernet/mediatek/mtk_ppe.h         | 2 +-
+ drivers/net/ethernet/mediatek/mtk_ppe_offload.c | 9 ++++++---
+ 3 files changed, 13 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -379,10 +379,15 @@ int mtk_foe_entry_set_ipv6_tuple(struct
+ }
+ 
+ int mtk_foe_entry_set_dsa(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+-			  int port)
++			  int proto, int port)
+ {
+ 	struct mtk_foe_mac_info *l2 = mtk_foe_entry_l2(eth, entry);
+ 
++	if (proto == DSA_TAG_PROTO_MXL862_8021Q) {
++		mtk_foe_entry_set_vlan(eth, entry, port + GENMASK(11, 10));
++		return 0;
++	}
++
+ 	l2->etype = BIT(port);
+ 
+ 	if (!(entry->ib1 & mtk_get_ib1_vlan_layer_mask(eth)))
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -463,7 +463,7 @@ int mtk_foe_entry_set_ipv6_tuple(struct
+ 				 __be32 *src_addr, __be16 src_port,
+ 				 __be32 *dest_addr, __be16 dest_port);
+ int mtk_foe_entry_set_dsa(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+-			  int port);
++			  int proto, int port);
+ int mtk_foe_entry_set_vlan(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+ 			   int vid);
+ int mtk_foe_entry_set_pppoe(struct mtk_eth *eth, struct mtk_foe_entry *entry,
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -167,7 +167,7 @@ mtk_flow_mangle_ipv4(const struct flow_a
+ }
+ 
+ static int
+-mtk_flow_get_dsa_port(struct net_device **dev)
++mtk_flow_get_dsa_port(struct net_device **dev, int *proto)
+ {
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ 	struct dsa_port *dp;
+@@ -176,10 +176,12 @@ mtk_flow_get_dsa_port(struct net_device
+ 	if (IS_ERR(dp))
+ 		return -ENODEV;
+ 
+-	if (dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_MTK)
++	if (dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_MTK &&
++	    dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_MXL862_8021Q)
+ 		return -ENODEV;
+ 
+ 	*dev = dsa_port_to_conduit(dp);
++	*proto = dp->cpu_dp->tag_ops->proto;
+ 
+ 	return dp->index;
+ #else
+@@ -198,6 +200,7 @@ mtk_flow_set_output_device(struct mtk_et
+ {
+ 	struct mtk_wdma_info info = {};
+ 	int pse_port, dsa_port, queue;
++	int dsa_proto = DSA_TAG_PROTO_NONE;
+ 
+ 	if (mtk_flow_get_wdma_info(dev, dest_mac, &info) == 0) {
+ 		mtk_foe_entry_set_wdma(eth, foe, info.wdma_idx, info.queue,
+@@ -219,7 +222,7 @@ mtk_flow_set_output_device(struct mtk_et
+ 		goto out;
+ 	}
+ 
+-	dsa_port = mtk_flow_get_dsa_port(&dev);
++	dsa_port = mtk_flow_get_dsa_port(&dev, &dsa_proto);
+ 
+ 	if (dev == eth->netdev[0])
+ 		pse_port = PSE_GDM1_PORT;
+@@ -231,7 +234,7 @@ mtk_flow_set_output_device(struct mtk_et
+ 		return -EOPNOTSUPP;
+ 
+ 	if (dsa_port >= 0) {
+-		mtk_foe_entry_set_dsa(eth, foe, dsa_port);
++		mtk_foe_entry_set_dsa(eth, foe, dsa_proto, dsa_port);
+ 		queue = 3 + dsa_port;
+ 	} else {
+ 		queue = pse_port - 1;
